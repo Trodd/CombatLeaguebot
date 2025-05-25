@@ -14,6 +14,7 @@
     "fallback_category_id": 1369190317965971466,
     "scheduled_channel_id": 1369917929029763113,
     "leaderboard_channel_id": 1372106365430009897,
+    "team_list_channel_id": 1375715587568832574,
 
     "match_ping_full_team": true,
     "forfeit_affects_elo": false,
