@@ -1,6 +1,7 @@
 {
-    "bot_token": "Your_TOKEN_HERE",
-    "sheet_name": "YOUR_SHEET_NAME_HERE",
+    "bot_token": "BOT_TOKEN_HERE",
+    "sheet_name": "SHEET_NAME_HERE",
+    "guild_id": 1263390844690370602,
 
     "dev_override_ids": [
         1368820073443364905
@@ -19,10 +20,9 @@
     "match_ping_full_team": true,
     "forfeit_affects_elo": false,
     "weekly_challenge_limit": 1,
-    "minimum_teams_start": 4,
+    "minimum_teams_start": 2,
     "team_min_players": 1,
     "team_max_players": 6,
     "elo_win_points": 25,
     "elo_loss_points": -25
 }
-
