@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
@@ -7,6 +7,8 @@ import match
 import dev
 import command_buttons  # <-- League Command Panel buttons
 import asyncio, json
+import re
+import concurrent.futures
 from discord import Embed, NotFound, HTTPException
 
 # -------------------- Load config --------------------
@@ -67,7 +69,7 @@ scoring_sheet = get_or_create_sheet(spreadsheet, "Scoring", [
 leaderboard_sheet = get_or_create_sheet(spreadsheet, "Leaderboard", ["Team Name", "Rating", "Wins", "Losses", "Matches Played"])
 proposed_sheet = get_or_create_sheet(spreadsheet, "Match Proposed", ["Match ID", "Team A", "Team B", "Proposer ID", "Proposed Date", "Channel ID", "Message ID"])
 proposed_scores_sheet = get_or_create_sheet(spreadsheet, "Proposed Scores", ["Match ID", "Team A", "Team B", "Proposer ID", "Proposed Date", "Channel ID", "Message ID"])
-scheduled_sheet = get_or_create_sheet(spreadsheet, "Match Scheduled", ["match id","Team A", "Team B", "Proposer ID", "Scheduled Date", "Channel ID", "Message ID"])
+scheduled_sheet = get_or_create_sheet(spreadsheet, "Match Scheduled", ["Match ID","Team A", "Team B", "Scheduled Date"])
 weekly_matches_sheet = get_or_create_sheet(spreadsheet, "Weekly Matches", ["Week", "Team A", "Team B", "Match ID", "Scheduled Date"])
 challenge_sheet = get_or_create_sheet(spreadsheet, "Challenge Matches", ["Week", "Match ID", "Team A", "Team B", "Proposer ID", "Proposed Date", "Completion Date", "Status"])
 banned_sheet = get_or_create_sheet(spreadsheet, "Banned", ["User ID", "Username", "Reason", "Banned By", "Date"])
@@ -98,9 +100,6 @@ async def on_ready():
 
     # ✅ Delete old Dev Panels first
     await dev.cleanup_dev_panels(bot)
-
-    # ✅ Post new Dev Panels
-    await dev.post_dev_panel(bot, spreadsheet, DEV_OVERRIDE_IDS)
 
     # ✅ Post other panels (League etc) if needed
 
@@ -154,22 +153,35 @@ async def auto_update_team_embeds(bot, teams_sheet):
             await asyncio.sleep(300)
             continue
 
+        # 🔁 Always rebuild cache if empty
         if not message_cache:
+            print("[📤] Rebuilding message cache from history...")
             async for msg in channel.history(limit=100):
-                if msg.author == bot.user:
-                    break
-            else:
-                print("[📤] No existing team messages found. Reposting all team embeds.")
-                message_cache.clear()
+                if msg.author == bot.user and msg.embeds:
+                    embed = msg.embeds[0]
+                    team_name = embed.title.strip() if embed.title else None
+                    if team_name:
+                        message_cache[team_name] = msg.id
 
         current_teams = {}
         updated_cache = {}
 
-        for row in teams_sheet.get_all_values()[1:]:
+        def fetch_rows(sheet):
+            return sheet.get_all_values()[1:]
+
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            try:
+                team_rows = await asyncio.get_event_loop().run_in_executor(pool, fetch_rows, teams_sheet)
+            except Exception as e:
+                print(f"❗ Sheet fetch error: {e}")
+                await asyncio.sleep(300)
+                continue
+
+        for row in team_rows:
             if not row or not row[0].strip():
                 continue
 
-            team_name = row[0]
+            team_name = row[0].strip()
             members = row[1:7]
             mentions = []
 
@@ -182,7 +194,7 @@ async def auto_update_team_embeds(bot, teams_sheet):
 
             captain = mentions[0] if mentions else "N/A"
 
-            embed = Embed(title=f"{team_name}", color=0x3498db)
+            embed = Embed(title=team_name, color=0x3498db)
             embed.add_field(name="👑 Captain", value=captain, inline=False)
             embed.add_field(name="👥 Players", value="\n".join(mentions) if mentions else "None", inline=False)
 
@@ -202,9 +214,6 @@ async def auto_update_team_embeds(bot, teams_sheet):
                                 print(f"⚠️ Rate limit hit editing {team_name}. Backing off.")
                                 await asyncio.sleep(5)
                                 await msg.edit(embed=embed)
-                      #  print(f"📝 Updated embed for {team_name}")
-                   # else:
-                      #  print(f"✅ No change for {team_name}")
                     updated_cache[team_name] = msg.id
                     continue
                 except NotFound:
@@ -212,17 +221,17 @@ async def auto_update_team_embeds(bot, teams_sheet):
 
             msg = await channel.send(embed=embed)
             updated_cache[team_name] = msg.id
-            print(f"📤 Posted new embed for {team_name}")
 
+        # 🧹 Cleanup stale team messages
         for team_name, msg_id in message_cache.items():
             if team_name not in current_teams:
                 try:
                     msg = await channel.fetch_message(msg_id)
                     await msg.delete()
-                    print(f"🗑️ Deleted old embed for {team_name}")
                 except NotFound:
                     pass
 
+        # 💾 Save only the current team messages
         message_cache = updated_cache
         with open(cache_file, "w") as f:
             json.dump(message_cache, f, indent=2)
@@ -295,24 +304,185 @@ async def auto_update_team_embeds(bot, teams_sheet):
                 ]
 
                 # Save to scoring sheet
-                scoring_sheet = get_or_create_sheet("Scoring", [
-                    "Match ID", "Team A", "Team B",
-                    "Map 1 Mode", "Map 1 A", "Map 1 B",
-                    "Map 2 Mode", "Map 2 A", "Map 2 B",
-                    "Map 3 Mode", "Map 3 A", "Map 3 B",
-                    "Total A", "Total B",
-                    "Maps Won A", "Maps Won B",
-                    "Winner"
-                ])
+                scoring_sheet = get_or_create_sheet(
+                    self.parent.spreadsheet,
+                    "Scoring",
+                    [
+                        "Match ID", "Team A", "Team B",
+                        "Map 1 Mode", "Map 1 A", "Map 1 B",
+                        "Map 2 Mode", "Map 2 A", "Map 2 B",
+                        "Map 3 Mode", "Map 3 A", "Map 3 B",
+                        "Total A", "Total B",
+                        "Maps Won A", "Maps Won B",
+                        "Winner"
+                    ]
+                )
                 scoring_sheet.append_row(row)
 
                 await interaction.response.send_message(f"✅ Score submitted! **Winner: {winner}**", ephemeral=True)
 
 # -------------------- Bot Ready Event --------------------
 
+bot.was_disconnected = False  # Define this once near the top after bot = commands.Bot(...)
+
+def extract_id(text):
+    match = re.search(r"\((\d+)\)", text)
+    return match.group(1) if match else None
+
+
+async def cleanup_departed_members(bot, players_sheet, teams_sheet):
+    print("[🧹] Running startup cleanup...")
+
+    guild = bot.get_guild(config.get("guild_id"))
+    if not guild:
+        print("❌ Could not find guild.")
+        return
+
+    member_ids = {str(m.id) for m in guild.members}
+    removed = 0
+    disbanded = 0
+    promoted = 0
+
+    # Remove from Players sheet
+    players_rows = players_sheet.get_all_values()
+    for i in range(len(players_rows) - 1, 0, -1):
+        row = players_rows[i]
+        if not row: continue
+        uid = row[0]
+        if uid not in member_ids:
+            players_sheet.delete_rows(i + 1)
+            removed += 1
+            await send_notification(f"🗑️ Removed `{row[1]}` from the league (no longer in server).")
+
+    # Clean up Teams sheet
+    team_rows = teams_sheet.get_all_values()
+    for i in range(len(team_rows) - 1, 0, -1):
+        row = team_rows[i]
+        if not any(row): continue
+
+        team_name = row[0]
+        captain_id = extract_id(row[1])
+        team_member_ids = [extract_id(cell) for cell in row[1:7] if cell]
+        missing = [uid for uid in team_member_ids if uid not in member_ids]
+
+        if captain_id and captain_id not in member_ids:
+            replacement = extract_id(row[2]) if len(row) > 2 else None
+            if replacement and replacement in member_ids:
+                teams_sheet.update_cell(i + 1, 2, row[2])  # Promote Player 2
+                teams_sheet.update_cell(i + 1, 3, "")      # Clear old P2
+                promoted += 1
+                await send_notification(f"👑 Captain left — promoted Player 2 to captain of **{team_name}**.")
+            else:
+                teams_sheet.delete_rows(i + 1)
+                disbanded += 1
+                await send_notification(f"❌ Team **{team_name}** was disbanded (no captain or players left).")
+
+                # 🧼 Delete associated team roles
+                for suffix in ["", " Captain"]:
+                    role_name = f"Team {team_name}{suffix}"
+                    role = discord.utils.get(guild.roles, name=role_name)
+                    if role:
+                        try:
+                            await role.delete()
+                        except Exception as e:
+                            print(f"[⚠️] Could not delete role {role_name}: {e}")
+
+        else:
+            for j in range(1, 7):
+                cell = row[j]
+                uid = extract_id(cell)
+                if uid in missing:
+                    teams_sheet.update_cell(i + 1, j + 1, "")
+                    await send_notification(f"🚪 Removed `{cell}` from **{team_name}** (left the server)")
+
+    print(f"[✅] Cleanup done — Removed: {removed}, Disbanded: {disbanded}, Promoted: {promoted}")
+
+@bot.event
+async def on_member_remove(member):
+    user_id = str(member.id)
+    username = member.display_name.lower()
+
+    players = bot.players_sheet
+    teams = bot.teams_sheet
+
+    # Remove from Players sheet
+    removed_from_players = False
+    player_rows = players.get_all_values()
+    for i, row in enumerate(player_rows[1:], start=2):
+        if user_id == row[0] or username in row[1].lower():
+            players.delete_rows(i)
+            removed_from_players = True
+            break
+
+    # Search Teams sheet
+    team_rows = teams.get_all_values()
+    for i, row in enumerate(team_rows[1:], start=2):
+        if not any(row):
+            continue
+
+        team_name = row[0]
+        for j in range(1, 7):
+            if user_id in row[j] or username in row[j].lower():
+                teams.update_cell(i, j + 1, "")  # Clear the player cell
+
+                if j == 1:  # Captain left
+                    replacement = row[2] if len(row) > 2 and row[2].strip() else ""
+                    if replacement:
+                        teams.update_cell(i, 2, replacement)  # Promote Player 2
+                        teams.update_cell(i, 3, "")           # Optional: clear Player 2
+                        await send_notification(f"👑 `{username}` left — promoted Player 2 to captain for **{team_name}**.")
+                    else:
+                        # 🧼 Delete associated team roles
+                        guild = member.guild
+                        for suffix in ["", " Captain"]:
+                            role_name = f"Team {team_name}{suffix}"
+                            role = discord.utils.get(guild.roles, name=role_name)
+                            if role:
+                                try:
+                                    await role.delete()
+                                except Exception as e:
+                                    print(f"[⚠️] Could not delete role {role_name}: {e}")
+
+                        teams.delete_rows(i)
+                        await send_notification(f"❌ `{username}` left — disbanded team **{team_name}** (no other players).")
+
+                else:
+                    await send_notification(f"🚪 `{username}` left and was removed from **{team_name}**.")
+                return
+
+    if removed_from_players:
+        await send_notification(f"🚪 `{username}` left the server and was removed from the league.")
+
+
+@tasks.loop(seconds=30)
+async def watchdog_check():
+    try:
+        if bot.is_closed():
+            print("[🔌] Bot connection closed.")
+            return
+
+        if bot.was_disconnected:
+            print("[🔁] Bot reconnected to Discord.")
+            channel = bot.get_channel(config.get("dev_channel_id"))
+            if channel:
+                await channel.send("✅ Bot has reconnected to Discord.")
+            bot.was_disconnected = False
+
+        _ = len(bot.guilds)  # Health check
+
+    except Exception as e:
+        print(f"[⚠️] Discord unreachable: {e}")
+        bot.was_disconnected = True
+
 @bot.event
 async def on_ready():
     await bot.tree.sync()
+
+    await cleanup_departed_members(bot, players_sheet, teams_sheet)
+
+    if not watchdog_check.is_running():
+        watchdog_check.start()
+
     print(f"Bot ready as {bot.user}")
 
     panel_channel = bot.get_channel(PANEL_CHANNEL_ID)
@@ -323,7 +493,6 @@ async def on_ready():
                 if msg.author == bot.user and msg.embeds:
                     if msg.embeds[0].title == "📋 League Command Panel":
                         await msg.delete()
-                        print("Deleted old League Command Panel.")
         except Exception as e:
             print(f"Failed to delete old panel: {e}")
 
@@ -348,32 +517,163 @@ async def on_ready():
 
         bot.add_view(view)
         bot.league_panel = view  # make LeaguePanel accessible for views like AcceptDenyMatchView
+        bot.scheduled_sheet = scheduled_sheet
+        channel_id = config.get("panel_channel_id")
+        if not channel_id:
+            print("❌ No panel_channel_id configured.")
+            return
 
-        embed = discord.Embed(
-            title="📋 League Command Panel",
-            description="Use the buttons below to manage your league registration, teams, and matches!",
-            color=discord.Color.blue()
-        )
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            print(f"❌ League panel channel not found: {channel_id}")
+            return
 
-        embed.add_field(name="✅ Player Signup", value="Sign up to participate in the league and become eligible to join or create teams.", inline=False)
-        embed.add_field(name="🏷️ Create Team", value="Register a new team. Captains can form teams and receive matches once the minimum players requirement is met.", inline=False)
-        embed.add_field(name="➕ Request to Join Team", value="Request to join an existing team. The team captain must approve your request.", inline=False)
-        embed.add_field(name="⭐ Promote Player", value="Team captains can promote another player to become the new captain.", inline=False)
-        embed.add_field(name="🚪 Leave Team", value="Leave your current team (only if you're not the captain).", inline=False)
-        embed.add_field(name="❌ Unsignup", value="Remove yourself from the league. You must leave your team first to do this.", inline=False)
-        embed.add_field(name="❗ Disband Team", value="Disband your team permanently (Captains and Developers only).", inline=False)
-        embed.add_field(name="📅 Propose Match", value="Propose a match against another team. The opponent captain must accept. If they can't be DMed, a fallback private channel is used.", inline=False)
-        embed.add_field(name="📊 Propose Score", value="Submit map-by-map scores after a match. Opponent captain must confirm. Uses fallback channel if needed.", inline=False)
+        # Look for existing panel message
+        existing = None
+        async for msg in channel.history(limit=25):
+            if msg.author == bot.user and len(msg.components) > 0:
+                existing = msg
+                break
 
-        embed.set_footer(text="⚡ Some actions require being a captain or developer. Captains manage teams and approve join requests.")
+        if existing:
+            try:
+                await existing.edit(view=bot.league_panel)
+            except Exception as e:
+                print(f"❌ Failed to reattach LeaguePanel: {e}")
+        else:
+            try:
+                embed = discord.Embed(
+                    title="📋 League Command Panel",
+                    description="Use the buttons below to manage your league registration, teams, and matches!",
+                    color=discord.Color.blue()
+                )
+                embed.add_field(name="✅ Player Signup", value="Sign up to participate in the league and become eligible to join or create teams.", inline=False)
+                embed.add_field(name="🏷️ Create Team", value="Register a new team. Captains can form teams and receive matches once the minimum players requirement is met.", inline=False)
+                embed.add_field(name="➕ Request to Join Team", value="Request to join an existing team. The team captain must approve your request.", inline=False)
+                embed.add_field(name="⭐ Promote Player", value="Team captains can promote another player to become the new captain.", inline=False)
+                embed.add_field(name="🚪 Leave Team", value="Leave your current team (only if you're not the captain).", inline=False)
+                embed.add_field(name="❌ Unsignup", value="Remove yourself from the league. You must leave your team first to do this.", inline=False)
+                embed.add_field(name="❗ Disband Team", value="Disband your team permanently (Captains and Developers only).", inline=False)
+                embed.add_field(name="📅 Propose Match", value="Propose a match against another team. The opponent captain must accept. If they can't be DMed, a fallback private channel is used.", inline=False)
+                embed.add_field(name="📊 Propose Score", value="Submit map-by-map scores after a match. Opponent captain must confirm. Uses fallback channel if needed.", inline=False)
+                embed.set_footer(text="⚡ Some actions require being a captain or developer. Captains manage teams and approve join requests.")
 
-        await panel_channel.send(embed=embed, view=view)
-        print("Posted new League Command Panel!")
-        bot.loop.create_task(auto_update_team_embeds(bot, teams_sheet))
+                await channel.send(embed=embed, view=bot.league_panel)
+
+            except Exception as e:
+                print(f"❌ Failed to post LeaguePanel: {e}")
+
+        # ✅ Rehydrate match proposals
+    proposed_rows = proposed_sheet.get_all_values()[1:]
+    for idx, row in enumerate(proposed_rows, start=2):  # start=2 to skip header
+        if len(row) < 7:
+            continue
+
+        match_id, team_a, team_b, proposer_id, proposed_date, channel_id, message_id = row
+        if not channel_id or not message_id or not channel_id.isdigit() or not message_id.isdigit():
+            print(f"⚠️ Skipping {match_id}: Invalid or missing channel/message ID")
+            continue
+
+        try:
+            channel = await bot.fetch_channel(int(channel_id))
+            message = await channel.fetch_message(int(message_id))
+
+            from command_buttons import AcceptDenyMatchView
+            from datetime import datetime
+
+            # Parse date from <t:timestamp:f> format
+            timestamp = int(proposed_date.split(":")[1])
+            proposed_datetime = datetime.utcfromtimestamp(timestamp)
+
+            view = AcceptDenyMatchView(
+                parent=bot.league_panel,
+                team_a=team_a,
+                team_b=team_b,
+                proposed_date_str=proposed_date,
+                match_id=match_id,
+                proposer_id=proposer_id,
+                proposed_datetime=proposed_datetime,
+                match_type="challenge" if "Challenge" in match_id else "assigned"
+            )
+            view.message = message
+            view.channel_to_delete = channel
+            await message.edit(view=view)
+
+        except Exception as e:
+            print(f"❌ Failed to rehydrate {match_id}: {e}")
+            try:
+                proposed_sheet.delete_rows(idx)
+            except Exception as cleanup_error:
+                print(f"⚠️ Failed to delete row {idx} for {match_id}: {cleanup_error}")
+    
+        # ✅ Rehydrate score confirmations
+    scheduled_rows = spreadsheet.values_get("Match Scheduled!A:D").get("values", [])[1:]
+    scheduled_ids = [row[0] for row in scheduled_rows if row]
+    score_rows = proposed_scores_sheet.get_all_values()[1:]
+
+    for idx, row in enumerate(score_rows, start=2):  # start=2 accounts for the header row
+        if len(row) < 7:
+            continue
+
+        match_id, team1, team2, proposer_id, proposed_date, channel_id, message_id = row
+
+        # 🛑 Skip if this match is already scheduled
+        if match_id in scheduled_ids:
+            print(f"⛔ Skipping rehydration of score for scheduled match: {match_id}")
+            continue
+
+        if not channel_id or not message_id or not channel_id.isdigit() or not message_id.isdigit():
+            print(f"⚠️ Skipping score {match_id}: Invalid or missing channel/message ID")
+            continue
+
+        try:
+            channel = await bot.fetch_channel(int(channel_id))
+            message = await channel.fetch_message(int(message_id))
+            guild = channel.guild
+
+            proposer = guild.get_member(int(proposer_id))
+            if not proposer:
+                continue
+
+            from command_buttons import ConfirmScoreView
+            from datetime import datetime
+
+            proposed_datetime = datetime.utcnow()
+
+            match_info = {
+                "match_id": match_id,
+                "team1": team1,
+                "team2": team2,
+                "date": proposed_date,
+                "proposed_datetime": proposed_datetime,
+                "is_challenge": "Challenge" in match_id,
+            }
+
+            view = ConfirmScoreView(
+                bot.league_panel,
+                match=match_info,
+                map_scores=[],
+                proposer=proposer,
+                proposer_id=proposer_id,
+                private_channel=channel
+            )
+            view.message = message
+            view.channel_to_delete = channel
+            await message.edit(view=view)
+
+        except Exception as e:
+            print(f"❌ Failed to rehydrate score for {match_id}: {e}")
+            try:
+                proposed_scores_sheet.delete_rows(idx)  # ✅ now using correct row index
+            except Exception as cleanup_error:
+                print(f"⚠️ Failed to clean up score row for {match_id}: {cleanup_error}")
 
     # ✅ POST DEV PANEL TOO
-    await dev.post_dev_panel(bot, spreadsheet, DEV_OVERRIDE_IDS)
+    await dev.post_dev_panel(bot, spreadsheet, DEV_OVERRIDE_IDS, send_notification)
     print("Posted Dev Panel!")
+
+    # ✅ Start team embed updater
+    bot.loop.create_task(auto_update_team_embeds(bot, teams_sheet))
 
 bot.run(BOT_TOKEN)
 
