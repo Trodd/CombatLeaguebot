@@ -27,11 +27,12 @@ class SafeView(View):
 # -------------------- MATCH TOOLS --------------------
 
 class DevPanel_Match(SafeView):
-    def __init__(self, bot, spreadsheet, dev_ids):
+    def __init__(self, bot, spreadsheet, dev_ids, send_notification):
         super().__init__(timeout=None)
         self.bot = bot
         self.spreadsheet = spreadsheet
         self.dev_ids = dev_ids
+        self.send_notification = send_notification
 
     async def interaction_check(self, interaction):
         return await check_dev(interaction, self.dev_ids)
@@ -145,11 +146,12 @@ class DevPanel_Match(SafeView):
 # -------------------- SCORE TOOLS --------------------
 
 class DevPanel_Score(SafeView):
-    def __init__(self, bot, spreadsheet, dev_ids):
+    def __init__(self, bot, spreadsheet, dev_ids, send_notification):
         super().__init__(timeout=None)
         self.bot = bot
         self.spreadsheet = spreadsheet
         self.dev_ids = dev_ids
+        self.send_notification = send_notification
 
     async def interaction_check(self, interaction):
         return await check_dev(interaction, self.dev_ids)
@@ -213,11 +215,12 @@ class DevPanel_Score(SafeView):
 # -------------------- TEAM TOOLS --------------------
 
 class DevPanel_Team(SafeView):
-    def __init__(self, bot, spreadsheet, dev_ids):
+    def __init__(self, bot, spreadsheet, dev_ids, send_notification):
         super().__init__(timeout=None)
         self.bot = bot
         self.spreadsheet = spreadsheet
         self.dev_ids = dev_ids
+        self.send_notification = send_notification
 
     async def interaction_check(self, interaction):
         return await check_dev(interaction, self.dev_ids)
@@ -231,12 +234,20 @@ class DevPanel_Team(SafeView):
                 sheet = get_or_create_sheet(self.parent.spreadsheet, "Teams", ["Team Name","Captain","Player 2","Player 3","Player 4","Player 5","Player 6"])
                 for idx, row in enumerate(sheet.get_all_values(), 1):
                     if row[0].lower() == self.team.value.lower():
-                        team_role = discord.utils.get(i.guild.roles, name=f"Team {row[0]}")
-                        captain_role = discord.utils.get(i.guild.roles, name=f"Team {row[0]} Captain")
-                        if team_role: await team_role.delete()
-                        if captain_role: await captain_role.delete()
+                        team_name = row[0]
+                        for suffix in ["", " Captain"]:
+                            role_name = f"Team {team_name}{suffix}"
+                            role = discord.utils.get(i.guild.roles, name=role_name)
+                            if role:
+                                try:
+                                    await role.delete()
+                                    print(f"[🧼] Deleted role: {role_name}")
+                                except Exception as e:
+                                    print(f"[⚠️] Could not delete role {role_name}: {e}")
+
                         sheet.delete_rows(idx)
-                        await self.parent.safe_send(i, "✅ Team disbanded.")
+                        await self.parent.send_notification(f"💥 **{row[0]}** was force disbanded by a Admin.")
+                        await self.parent.safe_send(i, f"✅ Team **{team_name}** disbanded and roles deleted.")
                         return
                 await self.parent.safe_send(i, "❗ Team not found.")
         await interaction.response.send_modal(DisbandModal(self))
@@ -253,6 +264,7 @@ class DevPanel_Team(SafeView):
                         if self.player.value.lower() in row[col].lower():
                             sheet.update_cell(idx, col + 1, "")
                             await self.parent.safe_send(i, "✅ Player removed.")
+                            await self.parent.send_notification(f"👤 `{row[col]}` was force removed from **{row[0]}** by a Admin.")
                             return
                 await self.parent.safe_send(i, "❗ Player not found.")
         await interaction.response.send_modal(RemovePlayerModal(self))
@@ -277,11 +289,12 @@ class DevPanel_Team(SafeView):
 # -------------------- PLAYER ENFORCEMENT --------------------
 
 class DevPanel_Player(SafeView):
-    def __init__(self, bot, spreadsheet, dev_ids):
+    def __init__(self, bot, spreadsheet, dev_ids, send_notification):
         super().__init__(timeout=None)
         self.bot = bot
         self.spreadsheet = spreadsheet
         self.dev_ids = dev_ids
+        self.send_notification = send_notification
 
     async def interaction_check(self, interaction):
         return await check_dev(interaction, self.dev_ids)
@@ -311,6 +324,8 @@ class DevPanel_Player(SafeView):
                                 if row[0] in trow[col] or row[1] in trow[col]:
                                     teams.update_cell(tidx, col + 1, "")
                         await self.parent.safe_send(si, f"✅ {action}ed player.")
+                        await self.parent.send_notification(f"🚫 `{row[1]}` was {action.lower()}ed from the league by a Admin.")
+
                 view = Confirm()
                 view.parent = self.parent
                 await i.response.send_message("Select player:", view=view, ephemeral=True)
@@ -327,11 +342,12 @@ class DevPanel_Player(SafeView):
 # -------------------- SYSTEM TOOLS --------------------
 
 class DevPanel_System(SafeView):
-    def __init__(self, bot, spreadsheet, dev_ids):
+    def __init__(self, bot, spreadsheet, dev_ids, send_notification):
         super().__init__(timeout=None)
         self.bot = bot
         self.spreadsheet = spreadsheet
         self.dev_ids = dev_ids
+        self.send_notification = send_notification
 
     async def interaction_check(self, interaction):
         return await check_dev(interaction, self.dev_ids)
@@ -364,7 +380,7 @@ class DevPanel_System(SafeView):
 
 # -------------------- Dev Panel Poster --------------------
 
-async def post_dev_panel(bot, spreadsheet, dev_ids):
+async def post_dev_panel(bot, spreadsheet, dev_ids, send_notification):
 
     channel_id = bot.config.get("dev_channel_id")
     if not channel_id:
@@ -389,7 +405,7 @@ async def post_dev_panel(bot, spreadsheet, dev_ids):
         print(f"✅ Cleaned {deleted} old {title} panels.")
 
         embed = discord.Embed(title=title, description=f"{title} for developer/admin usage.", color=discord.Color.red())
-        view = view_cls(bot, spreadsheet, dev_ids)
+        view = view_cls(bot, spreadsheet, dev_ids, send_notification)
         await channel.send(embed=embed, view=view)
         bot.add_view(view)  # ✅ Register persistent view
 
