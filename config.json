@@ -2,6 +2,9 @@
     "bot_token": "BOT_TOKEN_HERE",
     "sheet_name": "SHEET_NAME_HERE",
     "guild_id": 1263390844690370602,
+    "player_role_id": 1380728178137370756,
+    "league_sub_role_id": 1380728078078312458,
+    "universal_captain_role_id": 1380727979281223731,
 
     "dev_override_ids": [
         1368820073443364905
@@ -16,7 +19,9 @@
     "scheduled_channel_id": 1369917929029763113,
     "leaderboard_channel_id": 1372106365430009897,
     "team_list_channel_id": 1375715587568832574,
+    "sub_ping_channel_id": 1381101250736816188,
 
+    "roster_lock_timestamp": "2025-06-22T23:59:00",
     "match_ping_full_team": true,
     "forfeit_affects_elo": false,
     "weekly_challenge_limit": 1,
@@ -24,5 +29,11 @@
     "team_min_players": 1,
     "team_max_players": 6,
     "elo_win_points": 25,
-    "elo_loss_points": -25
+    "elo_loss_points": -25,
+    "default_player_rating": 800,
+    "default_team_rating": 800,
+    "season_start": "2025-06-10",
+    "season_end": "2025-08-31"
+
+
 }
