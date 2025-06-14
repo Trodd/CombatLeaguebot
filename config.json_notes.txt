@@ -76,3 +76,9 @@ minimum_teams_start:
 
 team_min_players:
 - Minimum number of players required for a team to be eligible for matches.
+
+season_start:
+- Choose the date that the league starts, usually to prevent players to schedule matches before season start.
+
+season_end:
+- Choose the date that the league ends, usually to prevent players from scheduling after season end.
