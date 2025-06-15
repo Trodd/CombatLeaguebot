@@ -79,6 +79,8 @@ team_min_players:
 
 season_start:
 - Choose the date that the league starts, usually to prevent players to schedule matches before season start.
+- Include the time in UTC (T00:00:00) if you want it to end sometime during the date, if not it will start when it exactly becomes the date.
 
 season_end:
 - Choose the date that the league ends, usually to prevent players from scheduling after season end.
+- - Include the time in UTC (T00:00:00) if you want it to end sometime during the date, if not it will start when it exactly becomes the date.
