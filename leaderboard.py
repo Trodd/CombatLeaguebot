@@ -30,20 +30,32 @@ leaderboard_sheet = spreadsheet.worksheet("Leaderboard")
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-def get_tier_label(rating):
+def get_tier_label(rating: int) -> str:
     r = int(rating)
-    if r >= 1400:
-        return "🟪 **Master**"
-    elif r >= 1200:
-        return "🟦 **Platinum**"
-    elif r >= 1050:
-        return "💎 **Diamond**"
-    elif r >= 900:
-        return "🟨 **Gold**"
-    elif r >= 750:
-        return "⚪ **Silver**"
-    else:
-        return "🟫 **Bronze**"
+    if r >= 1600: return "**🟪 IV**"
+    elif r >= 1550: return "**🟪 III**"
+    elif r >= 1500: return "**🟪 II**"
+    elif r >= 1450: return "**🟪 I**"
+    elif r >= 1400: return "**🟦 IV**"
+    elif r >= 1350: return "**🟦 III**"
+    elif r >= 1300: return "**🟦 II**"
+    elif r >= 1250: return "**🟦 I**"
+    elif r >= 1200: return "**💎 IV**"
+    elif r >= 1150: return "**💎 III**"
+    elif r >= 1100: return "**💎 II**"
+    elif r >= 1050: return "**💎 I**"
+    elif r >= 1000: return "**🟨 IV**"
+    elif r >= 975: return "**🟨 III**"
+    elif r >= 950: return "**🟨 II**"
+    elif r >= 900: return "**🟨 I**"
+    elif r >= 850: return "**⚪ IV**"
+    elif r >= 825: return "**⚪ III**"
+    elif r >= 800: return "**⚪ II**"
+    elif r >= 750: return "**⚪ I**"
+    elif r >= 700: return "**🟫 IV**"
+    elif r >= 675: return "**🟫 III**"
+    elif r >= 650: return "**🟫 II**"
+    else: return "**🟫 I**"
 
 @bot.event
 async def on_ready():
@@ -83,15 +95,27 @@ async def post_or_update_leaderboard_embed():
     new_ids = []
     for page_num, chunk in enumerate(chunks, 1):
         embed = discord.Embed(
-            title=f"🏆 League Leaderboard (Page {page_num}/{len(chunks)})",
+            title=f"🏆 Team Leaderboard (Page {page_num}/{len(chunks)})",
             description="Sorted by rating",
             color=discord.Color.purple()
         )
-        embed.set_footer(text="Mobile-friendly leaderboard • Updated hourly")
+        embed.set_footer(text="Updated hourly • Rank key shown on Page 1")
+
+        if page_num == 1:
+            tier_legend = (
+                "🟪 Master  → 1450–1600+\n"
+                "🟦 Diamond → 1250–1449\n"
+                "💎 Platinum → 1050–1249\n"
+                "🟨 Gold    →  900–1049\n"
+                "⚪ Silver  →  750–899\n"
+                "🟫 Bronze  → Below 750\n\n"
+                "Tiers: I (lowest) → IV (highest)"
+            )
+            embed.add_field(name="📊 Rank Tier Breakdown", value=f"```{tier_legend}```", inline=False)
 
         for i, row in enumerate(chunk, 1 + (page_num - 1) * 25):
             team, rating, wins, losses, matches = row[:5]
-            tier = get_tier_label(rating).split()[0]  # emoji only
+            tier = get_tier_label(int(rating))
             name_line = f"**#{i}** {tier} `{team}`"
             stats_line = f"🎯 {rating}  |  ✅ {wins}  ❌ {losses}  📊 {matches}"
             embed.add_field(name=name_line, value=stats_line, inline=False)
@@ -123,5 +147,15 @@ async def post_or_update_leaderboard_embed():
 
     print(f"✅ Leaderboard updated across {len(new_ids)} embed(s).")
 
-# === Run bot ===
-bot.run(config["bot_token"])
+# --------- Run Player leaderboard ---------
+import threading
+import player_leaderboard  # Make sure this file exists and is structured correctly
+
+def run_player_bot():
+    player_leaderboard.bot.run(player_leaderboard.config["bot_token"])
+
+if __name__ == "__main__":
+    threading.Thread(target=run_player_bot, daemon=True).start()
+
+    bot.run(config["bot_token"])
+
