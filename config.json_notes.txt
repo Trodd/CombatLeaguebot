@@ -48,6 +48,10 @@ scheduled_channel_id:
 leaderboard_channel_id:
 - Channel ID where leaderboard embeds are posted and updated.
 
+player_leaderboard_id:
+- Chaneel ID where player leaderboard are posted.
+-Recommend keeping seperate from leaderboard_channel.
+
 team_list_channel_id:
 - Channel ID where the live team list embed is posted.
 
