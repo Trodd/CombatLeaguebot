@@ -224,6 +224,134 @@ class DevPanel_Team(SafeView):
 
     async def interaction_check(self, interaction):
         return await check_dev(interaction, self.dev_ids)
+    
+    @discord.ui.button(label="📋 Set All Team Status", style=discord.ButtonStyle.blurple, custom_id="dev:set_all_team_status")
+    async def set_all_team_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await check_dev(interaction, self.dev_ids):
+            return
+
+        class StatusDropdown(discord.ui.View):
+            def __init__(self, parent):
+                super().__init__(timeout=30)
+                self.parent = parent
+
+                options = [
+                    discord.SelectOption(label="✅ Set All Active", value="Active"),
+                    discord.SelectOption(label="🛑 Set All Inactive", value="Inactive"),
+                ]
+                select = discord.ui.Select(placeholder="Choose team status for ALL teams", options=options)
+                select.callback = self.apply_bulk_status
+                self.add_item(select)
+
+            async def apply_bulk_status(self, i: discord.Interaction):
+                new_status = i.data["values"][0]
+                sheet = get_or_create_sheet(self.parent.spreadsheet, "Teams", [])
+                rows = sheet.get_all_values()
+                updated = 0
+
+                for idx, row in enumerate(rows[1:], start=2):
+                    if not row or not row[0].strip():
+                        continue
+                    while len(row) < 8:
+                        row.append("")
+                    if row[7].strip() != new_status:
+                        sheet.update_cell(idx, 8, new_status)
+                        updated += 1
+
+  #              await self.parent.safe_send(i, f"✅ Set `{new_status}` for {updated} team(s).")
+  #              await self.parent.send_notification(f"📋 Bulk status update: **{new_status}** applied to {updated} teams.")
+
+        await interaction.response.send_message("Select a status to apply to all teams:", view=StatusDropdown(self), ephemeral=True)
+    
+    @discord.ui.button(label="📡 Set One Team Status", style=discord.ButtonStyle.blurple, custom_id="dev:set_team_status_modal")
+    async def set_one_team_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await check_dev(interaction, self.dev_ids):
+            return
+
+        class TeamSearchModal(discord.ui.Modal, title="Search Team Name"):
+            query = discord.ui.TextInput(label="Enter part of team name", required=True)
+
+            def __init__(self, parent):
+                super().__init__()
+                self.parent = parent
+
+            async def on_submit(self, i: discord.Interaction):
+                sheet = get_or_create_sheet(self.parent.spreadsheet, "Teams", [])
+                all_rows = sheet.get_all_values()[1:]
+                matched = [r[0] for r in all_rows if r and self.query.value.lower() in r[0].lower()]
+
+                if not matched:
+                    await self.parent.safe_send(i, "❗ No team found matching that name.")
+                    return
+
+                matched = matched[:25]  # Discord max
+                options = [discord.SelectOption(label=team, value=team) for team in matched]
+
+                class StatusSelectView(discord.ui.View):
+                    def __init__(self, parent, team_options):
+                        super().__init__(timeout=60)
+                        self.parent = parent
+                        self.selected_team = None
+
+                        select_team = discord.ui.Select(placeholder="Select team", options=team_options)
+                        select_team.callback = self.select_team
+                        self.add_item(select_team)
+
+                    async def select_team(self, inner: discord.Interaction):
+                        self.selected_team = inner.data["values"][0]
+                        self.clear_items()
+                        self.add_item(self.StatusOption(self))
+                        await inner.response.edit_message(content=f"Set status for `{self.selected_team}`:", view=self)
+
+                    class StatusOption(discord.ui.Select):
+                        def __init__(self, parent_view):
+                            self.parent_view = parent_view
+                            options = [
+                                discord.SelectOption(label="✅ Active", value="Active"),
+                                discord.SelectOption(label="🛑 Inactive", value="Inactive")
+                            ]
+                            super().__init__(placeholder="Choose new status", options=options)
+
+                        async def callback(self, i: discord.Interaction):
+                            team = self.parent_view.selected_team
+                            new_status = self.values[0]
+                            sheet = get_or_create_sheet(self.parent_view.parent.spreadsheet, "Teams", [])
+                            updated = False
+
+                            for idx, row in enumerate(sheet.get_all_values()[1:], start=2):
+                                if row[0] == team:
+                                    while len(row) < 8:
+                                        row.append("")
+                                    sheet.update_cell(idx, 8, new_status)
+                                    updated = True
+                                    break
+
+                            if updated:
+                                await self.parent_view.parent.safe_send(i, f"✅ `{team}` status set to `{new_status}`.")
+                                # Attempt to ping the captain
+                                try:
+                                    teams_sheet = get_or_create_sheet(self.parent_view.parent.spreadsheet, "Teams", [])
+                                    team_row = next((r for r in teams_sheet.get_all_values()[1:] if r[0] == team), None)
+
+                                    captain_mention = team
+                                    if team_row and len(team_row) > 1 and "(" in team_row[1] and ")" in team_row[1]:
+                                        captain_id = team_row[1].split("(")[-1].split(")")[0]
+                                        captain_mention = f"<@{captain_id}>"
+
+                                    await self.parent_view.parent.send_notification(
+                                        f"📡 `{team}` status changed to **{new_status}** by a League Mod.\n👑 Notifying captain: {captain_mention}"
+                                    )
+                                except Exception as e:
+                                    print(f"[⚠️] Failed to notify captain of {team}: {e}")
+                                    await self.parent_view.parent.send_notification(
+                                        f"📡 `{team}` status changed to **{new_status}** by a League Mod. (⚠️ Could not resolve captain mention)"
+                                    )
+                            else:
+                                await self.parent_view.parent.safe_send(i, "❗ Failed to update status.")
+
+                await i.response.send_message("Select the team and status:", view=StatusSelectView(self.parent, options), ephemeral=True)
+
+        await interaction.response.send_modal(TeamSearchModal(self))
 
     @discord.ui.button(label="💥 Force Disband Team", style=discord.ButtonStyle.red, custom_id="dev:disband_team")
     async def force_disband(self, interaction, button):
