@@ -162,51 +162,51 @@ def archive_and_clear_challenges(spreadsheet):
     challenge_sheet.clear()
     challenge_sheet.append_row(["Week", "Team A", "Team B", "Proposer ID", "Completion Date"])
 
-async def generate_weekly_matches(interaction, spreadsheet, week_number, force=False):
+async def generate_weekly_matches(interaction, spreadsheet, week_number, force=True):
+    from collections import defaultdict
+
     if not interaction.response.is_done():
-        archive_and_clear_challenges(spreadsheet)
         await interaction.response.defer()
 
     with open("config.json") as f:
-        config_data = json.load(f)
+        config = json.load(f)
 
-    min_teams_required = config_data.get("minimum_teams_start", 2)
-    team_min_players = config_data.get("team_min_players", 1)
-    match_channel_id = config_data.get("weekly_channel_id")
-    elo_win = config_data.get("elo_win_points", 25)
-    elo_loss = config_data.get("elo_loss_points", -25)
-    affect_elo = config_data.get("forfeit_affects_elo", True)
-    ping_full_team = config_data.get("match_ping_full_team", True)
+    min_teams_required = config.get("minimum_teams_start", 2)
+    team_min_players = config.get("team_min_players", 1)
+    match_channel_id = config.get("weekly_channel_id")
+    elo_win = config.get("elo_win_points", 25)
+    elo_loss = config.get("elo_loss_points", -25)
+    affect_elo = config.get("forfeit_affects_elo", True)
+    ping_full_team = config.get("match_ping_full_team", True)
 
     matches_sheet = get_or_create_sheet(spreadsheet, "Matches", ["Match ID", "Team A", "Team B", "Proposed Date", "Scheduled Date", "Status", "Winner", "Loser", "Proposed By"])
     leaderboard_sheet = get_or_create_sheet(spreadsheet, "Leaderboard", ["Team Name", "Rating", "Wins", "Losses", "Matches Played"])
     weekly_sheet = get_or_create_sheet(spreadsheet, "Weekly Matches", ["Week", "Team A", "Team B", "Match ID", "Scheduled Date"])
     teams_sheet = get_or_create_sheet(spreadsheet, "Teams", ["Team Name", "Captain", "Player 2", "Player 3", "Player 4", "Player 5", "Player 6"])
-    sync_leaderboard_with_teams(config_data, teams_sheet, leaderboard_sheet)
+    sync_leaderboard_with_teams(config, teams_sheet, leaderboard_sheet)
 
-    all_teams = leaderboard_sheet.get_all_values()[1:]
-    if len(all_teams) < min_teams_required:
-        await interaction.followup.send("❗ Not enough teams to generate matchups.", ephemeral=True)
-        return
-        
-
-    valid_teams = []
+    # Step 0: Gather eligible teams
+    team_rows = teams_sheet.get_all_values()[1:]
     team_players = {}
+    valid_teams = []
 
-    for team_row in teams_sheet.get_all_values()[1:]:
-        team_name = team_row[0]
-        players = [p for p in team_row[1:] if p.strip()]
+    for row in team_rows:
+        team_name = row[0]
+        status = row[7].strip().lower() if len(row) > 7 else "active"
+        players = [p for p in row[1:7] if p.strip()]  # Only look at player slots (columns B to G)
+
         team_players[team_name] = len(players)
+
+        if status != "active":
+            continue
 
         if len(players) >= team_min_players:
             valid_teams.append(team_name)
 
-    if len(valid_teams) < min_teams_required:
-        await interaction.followup.send("❗ Not enough valid teams to generate matchups.", ephemeral=True)
-        return
-
+    # Step 1: Handle force cleanup
     if force:
-        # ✅ Clear weekly-related sheets before new matchups
+        archive_and_clear_challenges(spreadsheet)
+
         weekly_sheet.clear()
         weekly_sheet.append_row(["Week", "Team A", "Team B", "Match ID", "Scheduled Date"])
 
@@ -225,18 +225,17 @@ async def generate_weekly_matches(interaction, spreadsheet, week_number, force=F
         match_history_sheet = get_or_create_sheet(
             spreadsheet, "Match History",
             ["Week", "Match ID", "Team A", "Team B", "Proposed Date", "Scheduled Date",
-            "Map 1 Mode", "Map 1 A", "Map 1 B", "Map 2 Mode", "Map 2 A", "Map 2 B",
-            "Map 3 Mode", "Map 3 A", "Map 3 B", "Total A", "Total B", "Maps Won A", "Maps Won B", "Winner"]
+             "Map 1 Mode", "Map 1 A", "Map 1 B", "Map 2 Mode", "Map 2 A", "Map 2 B",
+             "Map 3 Mode", "Map 3 A", "Map 3 B", "Total A", "Total B", "Maps Won A", "Maps Won B", "Winner"]
         )
 
         existing = matches_sheet.get_all_values()[1:]
         for idx, row in enumerate(existing, start=2):
             fields = row[:9]
             if len(fields) < 9:
-                print(f"⚠️ Skipping malformed row (too short): {row}")
                 continue
 
-            match_id, team_a, team_b, _, _, status, winner, loser, _ = fields
+            match_id, team_a, team_b, _, _, status, _, _, _ = fields
 
             if status.strip() not in ["Finished", "Cancelled", "Forfeited"]:
                 team_a_valid = team_players.get(team_a, 0) >= team_min_players
@@ -245,7 +244,6 @@ async def generate_weekly_matches(interaction, spreadsheet, week_number, force=F
                 if team_a_valid and team_b_valid:
                     matches_sheet.update_cell(idx, 6, "Double Forfeit")
                     log_forfeit_to_history(match_history_sheet, week_number, match_id, team_a, team_b, "Double Forfeit")
-
                 elif team_a_valid:
                     matches_sheet.update_cell(idx, 6, "Forfeited")
                     matches_sheet.update_cell(idx, 7, team_a)
@@ -254,7 +252,6 @@ async def generate_weekly_matches(interaction, spreadsheet, week_number, force=F
                         update_team_rating(leaderboard_sheet, team_a, True, elo_win, elo_loss)
                         update_team_rating(leaderboard_sheet, team_b, False, elo_win, elo_loss)
                     log_forfeit_to_history(match_history_sheet, week_number, match_id, team_a, team_b, f"{team_b} Forfeit")
-
                 elif team_b_valid:
                     matches_sheet.update_cell(idx, 6, "Forfeited")
                     matches_sheet.update_cell(idx, 7, team_b)
@@ -263,59 +260,107 @@ async def generate_weekly_matches(interaction, spreadsheet, week_number, force=F
                         update_team_rating(leaderboard_sheet, team_b, True, elo_win, elo_loss)
                         update_team_rating(leaderboard_sheet, team_a, False, elo_win, elo_loss)
                     log_forfeit_to_history(match_history_sheet, week_number, match_id, team_a, team_b, f"{team_a} Forfeit")
-
                 else:
                     matches_sheet.update_cell(idx, 6, "Double Forfeit")
                     log_forfeit_to_history(match_history_sheet, week_number, match_id, team_a, team_b, "Double Forfeit")
 
-    valid_teams.sort(key=lambda x: int(next((row[1] for row in all_teams if row[0] == x), 1000)), reverse=True)
+    if len(valid_teams) < min_teams_required:
+        await interaction.followup.send("❗ Not enough valid teams to generate matchups.", ephemeral=True)
+        return
 
-    from collections import defaultdict
+    # Step 2: Get all team ELOs
+    all_teams = leaderboard_sheet.get_all_values()[1:]
+    team_ratings = {row[0]: int(row[1]) for row in all_teams if row[0] in valid_teams}
 
-    matchups = []
-    used_pairs = set()
-    match_count = defaultdict(int)
+    # Step 3: Bucket definitions and assignments
+    bucket_defs = [
+        ("Master", 1450, float('inf')),
+        ("Diamond", 1250, 1449),
+        ("Platinum", 1050, 1249),
+        ("Gold", 900, 1049),
+        ("Silver", 750, 899),
+        ("Bronze", 0, 749),
+    ]
 
-    for i, team in enumerate(valid_teams):
-        if match_count[team] >= 2:
-            continue
-        for opponent in valid_teams:
-            if opponent == team or match_count[opponent] >= 2:
-                continue
-
-            pair = tuple(sorted([team, opponent]))
-            if pair in used_pairs:
-                continue
-
-            # Schedule the match
-            used_pairs.add(pair)
-            matchups.append((team, opponent))
-            match_count[team] += 1
-            match_count[opponent] += 1
-
-            if match_count[team] >= 2:
+    buckets = {name: [] for name, _, _ in bucket_defs}
+    for team in valid_teams:
+        rating = team_ratings.get(team, 800)
+        for name, low, high in bucket_defs:
+            if low <= rating <= high:
+                buckets[name].append((team, rating))
                 break
 
+    # Step 4: Matchmaking with spillover
+    used_pairs = set()
+    matchups = []
+    match_count = defaultdict(int)
+
+    def can_match(a, b):
+        return match_count[a] < 2 and match_count[b] < 2 and tuple(sorted([a, b])) not in used_pairs
+
+    def add_match(a, b):
+        used_pairs.add(tuple(sorted([a, b])))
+        matchups.append((a, b))
+        match_count[a] += 1
+        match_count[b] += 1
+
+    bucket_names = [b[0] for b in bucket_defs]
+
+    for i, name in enumerate(bucket_names):
+        teams = [t[0] for t in sorted(buckets[name], key=lambda x: x[1], reverse=True)]
+        leftovers = []
+
+        for a in teams:
+            if match_count[a] >= 2:
+                continue
+            paired = False
+            for b in teams:
+                if a == b or not can_match(a, b):
+                    continue
+                add_match(a, b)
+                paired = True
+                break
+            if not paired:
+                leftovers.append(a)
+
+        for a in leftovers:
+            if match_count[a] >= 2:
+                continue
+            adjacents = []
+            if i > 0:
+                adjacents += [t[0] for t in buckets[bucket_names[i - 1]]]
+            if i < len(bucket_names) - 1:
+                adjacents += [t[0] for t in buckets[bucket_names[i + 1]]]
+            for b in adjacents:
+                if a != b and can_match(a, b):
+                    add_match(a, b)
+                    break
+
+    # Step 6: Notify
     match_channel = interaction.guild.get_channel(int(match_channel_id))
-    message_lines = [f"📢 **Week {week_number} Matchups:**\n"]
-
-    for team_a, team_b in matchups:
-        team_a_id, team_b_id = sorted([team_a[:3], team_b[:3]])
-        existing_week_matches = [row for row in weekly_sheet.get_all_values()[1:] if str(row[0]) == str(week_number)]
-        match_id = f"Week{week_number}-M{len(existing_week_matches) + 1:02d}"
-
-        weekly_sheet.append_row([week_number, team_a, team_b, match_id, "TBD"])
-        matches_sheet.append_row([match_id, team_a, team_b, "TBD", "", "Auto Proposed", "", "", "", "System"])
-
-        mentions_a = get_team_mentions(interaction, team_a, teams_sheet, ping_full_team)
-        mentions_b = get_team_mentions(interaction, team_b, teams_sheet, ping_full_team)
-
-        message_lines.append(f"🔹 {team_a} vs {team_b}\n{mentions_a} vs {mentions_b}\n")
-
     if match_channel:
-        await match_channel.send("\n".join(message_lines))
+        await match_channel.send(
+    f"━━━━━━━━━━━━━━━━━━━━\n📢 **__WEEK {week_number} MATCHUPS__**\n━━━━━━━━━━━━━━━━━━━━"
+)
 
-    await interaction.followup.send(f"✅ Week {week_number} matchups generated and posted in <#{match_channel_id}>.", ephemeral=True)
+        for index, (team_a, team_b) in enumerate(matchups, start=1):
+            match_id = f"Week{week_number}-M{index:03d}"
+
+            mentions_a = get_team_mentions(interaction, team_a, teams_sheet, ping_full_team)
+            mentions_b = get_team_mentions(interaction, team_b, teams_sheet, ping_full_team)
+
+            # Save to sheets with correct match_id
+            weekly_sheet.append_row([week_number, team_a, team_b, match_id, "TBD"])
+            matches_sheet.append_row([match_id, team_a, team_b, "TBD", "", "Auto Proposed", "", "", "", "System"])
+
+            message = (
+                f"🔹 **{team_a} vs {team_b}**\n"
+                f"{mentions_a} vs {mentions_b}\n"
+                f"📅 Match ID: `{match_id}`"
+            )
+            await match_channel.send(message)
+
+    await interaction.followup.send(f"✅ Week {week_number} matchups generated.", ephemeral=True)
 
 def setup_match_module(bot, spreadsheet):
     from discord import app_commands
