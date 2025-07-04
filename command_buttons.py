@@ -5,8 +5,10 @@ import re
 import pytz
 from datetime import datetime, timedelta, timezone
 from re import split
+from pathlib import Path
 import traceback
 import asyncio
+import os
 
 # Helper function to extract user ID from "Name (ID)"
 def extract_user_id(profile_string):
@@ -53,8 +55,37 @@ def is_captain_or_cocap(user_id: str, member: discord.Member, team_row: list, co
 
     return False
 
+PENDING_JOIN_FOLDER = "json"
+PENDING_JOIN_FILE = os.path.join(PENDING_JOIN_FOLDER, "pending_join_requests.json")
 
+# Ensure the folder exists
+os.makedirs(PENDING_JOIN_FOLDER, exist_ok=True)
 
+def save_join_request_to_file(entry):
+    try:
+        if os.path.exists(PENDING_JOIN_FILE):
+            with open(PENDING_JOIN_FILE, "r") as f:
+                data = json.load(f)
+        else:
+            data = []
+
+        data.append(entry)
+        with open(PENDING_JOIN_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[❌] Failed to save join request: {e}")
+
+def remove_join_request_from_file(message_id):
+    try:
+        if not os.path.exists(PENDING_JOIN_FILE):
+            return
+        with open(PENDING_JOIN_FILE, "r") as f:
+            data = json.load(f)
+        data = [entry for entry in data if entry.get("message_id") != message_id]
+        with open(PENDING_JOIN_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[❌] Failed to remove join request: {e}")
 
 async def safe_send(interaction, content, ephemeral=True):
     try:
@@ -64,6 +95,240 @@ async def safe_send(interaction, content, ephemeral=True):
             await interaction.response.send_message(content, ephemeral=ephemeral)
     except discord.NotFound:
         print("❗ Tried to send to an expired interaction.")
+
+class SignupView(discord.ui.View):
+    def __init__(self, bot, parent):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.parent = parent
+        self.role = None
+        self.timezone = None
+        self.add_item(self.PlatformCheckDropdown(self))
+        self.add_item(self.RoleSelect(self))
+        self.add_item(self.TimezoneSelect(self))
+    
+    class PlatformCheckDropdown(discord.ui.Select):
+        def __init__(self, view):
+            self.parent_view = view
+            options = [
+                discord.SelectOption(label="✅ Yes – I'm a PCVR Combat player", value="pcvr"),
+                discord.SelectOption(label="❌ No – I'm on Quest", value="not_pcvr")
+            ]
+            super().__init__(placeholder="Are you using PCVR with Combat? (Required)", options=options, row=0, custom_id="signup_pcvr_select")
+
+        async def callback(self, interaction: discord.Interaction):
+            if self.values[0] == "not_pcvr":
+                await interaction.response.edit_message(
+                    content=(
+                        "❌ This league is for **PCVR Combat players only**.\n"
+                        "Echo Combat is only playable on PC via SteamVR or Oculus PC (Quest + Link is okay).\n"
+                        "You are not eligible to sign up if you're using Quest-native.\n"
+                        "Close this message and try again if this was a mistake."
+                    ),
+                    view=None  # 🔒 Removes the dropdown view so they can't proceed
+                )
+                return
+            else:
+                self.view.platform_ok = True
+                await interaction.response.defer()
+
+    class RoleSelect(discord.ui.Select):
+        def __init__(self, view):
+            self.parent_view = view
+            options = [
+                discord.SelectOption(label="Player", value="Player"),
+                discord.SelectOption(label="League Sub", value="League Sub")
+            ]
+            super().__init__(placeholder="Choose your role...", options=options, row=1, custom_id="signup_role_select")
+
+        async def callback(self, interaction: discord.Interaction):
+            self.view.role = self.values[0]
+            await interaction.response.defer()
+
+    class TimezoneSelect(discord.ui.Select):
+        def __init__(self, view):
+            self.parent_view = view
+            options = [
+                discord.SelectOption(label="Pacific", value="US/Pacific"),
+                discord.SelectOption(label="Mountain", value="US/Mountain"),
+                discord.SelectOption(label="Central", value="US/Central"),
+                discord.SelectOption(label="Eastern", value="US/Eastern"),
+                discord.SelectOption(label="Atlantic", value="Canada/Atlantic"),
+                discord.SelectOption(label="UK / London", value="Europe/London"),
+                discord.SelectOption(label="Central Europe", value="Europe/Paris"),
+                discord.SelectOption(label="Eastern Europe", value="Europe/Athens")
+            ]
+            super().__init__(placeholder="Choose your timezone...", options=options, row=2, custom_id="signup_timezone_select")
+
+        async def callback(self, interaction: discord.Interaction):
+            self.view.timezone = self.values[0]
+            await interaction.response.defer()
+
+    @discord.ui.button(label="✅ Submit", style=discord.ButtonStyle.green, row=3, custom_id="signup_submit")
+    async def submit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not getattr(self, "platform_ok", False):
+            await interaction.response.send_message(
+                "❗ You must confirm you're a PCVR Combat player before signing up.",
+                ephemeral=True
+            )
+            return
+        role = self.role
+        tz = self.timezone
+
+        if not role or not tz:
+            await interaction.response.send_message("❗ Please select both a role and a timezone.", ephemeral=True)
+            return
+
+        user_id = str(interaction.user.id)
+        username = interaction.user.display_name
+
+        try:
+            players_sheet = self.bot.spreadsheet.worksheet("Players")
+            existing_players = players_sheet.get_all_values()[1:]  # Skip header
+
+            if any(row[0] == user_id for row in existing_players):
+                await interaction.response.send_message("❗ You're already signed up.", ephemeral=True)
+                return
+
+            players_sheet.append_row([user_id, username, role, tz])
+
+            leaderboard = self.bot.player_leaderboard_sheet
+            if not any(row[1] == user_id for row in leaderboard.get_all_values()[1:]):
+                default_elo = self.bot.config.get("default_player_rating", 1025)
+                leaderboard.append_row([username, user_id, str(default_elo), "0", "0", "0"])
+        except Exception as e:
+            print(f"[❌] Failed to store signup: {e}")
+            await interaction.response.send_message("❗ Signup failed. Try again later.", ephemeral=True)
+            return
+
+        try:
+            guild = interaction.guild
+            if guild:
+                role_id = self.bot.config.get("player_role_id") if role == "Player" else self.bot.config.get("league_sub_role_id")
+                role_obj = guild.get_role(role_id)
+                if role_obj:
+                    await interaction.user.add_roles(role_obj)
+        except discord.Forbidden:
+            print(f"⚠️ Could not assign role to {interaction.user}")
+
+        if self.parent and hasattr(self.parent, "send_notification"):
+            await self.parent.send_notification(f"📌 {interaction.user.mention} signed up as **{role}**")
+
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(content=f"✅ Signed up as **{role}** in `{tz}` time!", view=None)
+            else:
+                await interaction.followup.send(f"✅ Signed up as **{role}** in `{tz}` time!", ephemeral=True)
+        except discord.NotFound:
+            print("⚠️ Interaction expired or not found when editing message.")
+
+class AcceptDenyJoinRequestView(discord.ui.View):
+    def __init__(self, parent_view, team_name, invitee, guild_id, captain):
+        super().__init__(timeout=None)
+        self.parent_view = parent_view
+        self.team_name = team_name
+        self.invitee = invitee
+        self.guild_id = guild_id
+        self.captain = captain
+        self.request_handled = False
+
+#    async def expire_notice_dm(self):
+#       await asyncio.sleep(179)  # 1 second before timeout
+#        if self.request_handled:
+#            return
+#        try:
+#            await self.captain.send(
+#                f"❌ The join request from **{self.invitee.display_name}** has expired.\n"
+#                "Please ask them to send another request if you'd still like to add them."
+#            )
+#        except discord.Forbidden:
+#            print(f"📪 Could not DM captain {self.captain.display_name} with expiration notice.")
+
+    @discord.ui.button(label="✅ Accept", style=discord.ButtonStyle.success, custom_id="team_join_accept")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.request_handled = True
+        remove_join_request_from_file(interaction.message.id)
+        guild = self.parent_view.bot.get_guild(self.guild_id)
+        team_role = discord.utils.get(guild.roles, name=f"Team {self.team_name}")
+
+        if not team_role:
+            await interaction.response.send_message("❗ Team role no longer exists.", ephemeral=True)
+            return
+
+        already_on_team = False
+        for row in self.parent_view.teams_sheet.get_all_values():
+            for cell in row[1:7]:
+                if cell.strip() == f"{self.invitee.display_name} ({self.invitee.id})":
+                    already_on_team = True
+                    break
+            if already_on_team:
+                break
+
+        if already_on_team:
+            await interaction.response.send_message("❗ Player is already on another team.", ephemeral=True)
+            return
+
+        await self.invitee.add_roles(team_role)
+
+        for idx, row in enumerate(self.parent_view.teams_sheet.get_all_values(), 1):
+            if row[0].lower() == self.team_name.lower():
+                max_players = self.parent_view.config.get("team_max_players", 6)
+                current_players = [p for p in row[1:7] if p.strip()]
+                if len(current_players) >= max_players:
+                    await interaction.response.send_message(
+                        f"❗ This team already has the maximum number of players ({max_players}).",
+                        ephemeral=True
+                    )
+                    return
+                for i in range(1, 7):
+                    if row[i] == "":
+                        self.parent_view.teams_sheet.update_cell(idx, i + 1, f"{self.invitee.display_name} ({self.invitee.id})")
+                        break
+
+                # ✅ Re-fetch the updated row
+                updated_row = self.parent_view.teams_sheet.row_values(idx)
+                player_count = sum(1 for cell in updated_row[1:7] if cell.strip())
+                min_required = self.parent_view.config.get("team_min_players", 3)
+
+                if player_count == min_required:
+                    try:
+                        # 🔍 Extract captain user ID from the row
+                        captain_cell = row[1]
+                        captain_id = extract_user_id(captain_cell)
+
+                        captain_mention = f"<@{captain_id}>" if captain_id else "Captain"
+
+                        await self.parent_view.send_notification(
+                            f"✅ <@{captain_id}> — your team **{self.team_name}** has reached the minimum required players ({min_required}) and is now eligible for matches!"
+                        )
+
+                    except Exception as e:
+                        print(f"❗ Failed to send team eligibility notification: {e}")
+                break
+
+        await safe_send(interaction, "✅ Player added to team.")
+
+        try:
+            await self.parent_view.send_notification(
+                f"👥 {self.invitee.mention} has joined **{self.team_name}**!"
+            )
+        except Exception as e:
+            print(f"❗ Failed to send join team notification: {e}")
+
+        await interaction.message.delete()
+
+        if isinstance(interaction.channel, discord.TextChannel) and interaction.channel.name == "team-requests":
+            await interaction.channel.delete()
+
+    @discord.ui.button(label="❌ Deny", style=discord.ButtonStyle.danger, custom_id="team_join_deny")
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.request_handled = True
+        remove_join_request_from_file(interaction.message.id)
+        await interaction.response.send_message("❌ Request denied.", ephemeral=True)
+        await interaction.message.delete()
+
+        if isinstance(interaction.channel, discord.TextChannel) and interaction.channel.name == "team-requests":
+            await interaction.channel.delete()
 
 class AcceptDenyMatchView(discord.ui.View):
             def __init__(self, parent, team_a, team_b, proposed_date_str, match_id, proposer_id, match_type="assigned", week_number=None, proposed_datetime=None):
@@ -79,6 +344,12 @@ class AcceptDenyMatchView(discord.ui.View):
                 self.proposer_id = proposer_id
                 self.message = None
                 self.channel_to_delete = None
+
+                if self.week_number is None and self.match_type == "challenge":
+                    try:
+                        self.week_number = int(re.search(r"Challenge(\d+)", self.match_id).group(1))
+                    except Exception:
+                        self.week_number = "?"
 
             @discord.ui.button(label="✅ Accept", style=discord.ButtonStyle.success, custom_id="league:match_accept")
             async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -116,18 +387,32 @@ class AcceptDenyMatchView(discord.ui.View):
                 discord_time_fmt = f"<t:{discord_ts}:f>"
                 discord_relative = f"<t:{discord_ts}:R>"
 
-                # Add to scheduled sheet
-                try:
-                    body = {
-                        "values": [[self.match_id, self.team_a, self.team_b, self.proposed_date]]
-                    }
-                    self.parent.spreadsheet.values_append(
-                        "Match Scheduled!A:D",
-                        params={"valueInputOption": "USER_ENTERED"},
-                        body=body
-                    )
-                except Exception as e:
-                    print(f"[❌] Low-level append to Match Scheduled failed: {e}")
+                # ✅ Update or append to Match Scheduled
+                scheduled_sheet = get_or_create_sheet(
+                    self.parent.spreadsheet,
+                    "Match Scheduled",
+                    ["Match ID", "Team A", "Team B", "Scheduled Date"]
+                )
+
+                updated = False
+                for idx, row in enumerate(scheduled_sheet.get_all_values()[1:], start=2):  # skip header
+                    row_id = row[0].strip().lower()
+                    if row_id == self.match_id.strip().lower():
+                        scheduled_sheet.update_cell(idx, 4, self.proposed_date)
+                        updated = True
+                        break
+
+                if not updated:
+                    try:
+                        scheduled_sheet.append_row([
+                            self.match_id,
+                            self.team_a,
+                            self.team_b,
+                            self.proposed_date
+                        ])
+                    except Exception as e:
+                        print(f"[❌] Failed to append to Match Scheduled: {e}")
+
 
                 # ✅ Remove from Proposed Matches
                 for idx, row in enumerate(self.parent.proposed_sheet.get_all_values()[1:], start=2):
@@ -149,21 +434,28 @@ class AcceptDenyMatchView(discord.ui.View):
                     ["Match ID", "Team A", "Team B", "Proposed Date", "Scheduled Date", "Status", "Winner", "Loser", "Proposed By"]
                 )
 
+                match_id_lower = self.match_id.strip().lower()
+                found = False
+
+                updated = False
                 for idx, row in enumerate(match_sheet.get_all_values()[1:], start=2):
                     row_id = row[0].strip().lower()
-                    match_id = self.match_id.strip().lower()
+                    row_team_a = row[1].strip().lower()
+                    row_team_b = row[2].strip().lower()
 
-                    # Strip prefix and split
-                    row_parts = split(r'\d+-', row_id)[-1].split('-')  # e.g., Amo-Bis
-                    match_parts = split(r'\d+-', match_id)[-1].split('-')  # e.g., Bis-Amo
-
-                    if sorted(row_parts) == sorted(match_parts):
+                    # Strict match on Match ID and both team names
+                    if (
+                        row_id == self.match_id.strip().lower() and
+                        {row_team_a, row_team_b} == {self.team_a.strip().lower(), self.team_b.strip().lower()}
+                    ):
                         match_sheet.update_cell(idx, 4, self.proposed_date)
                         match_sheet.update_cell(idx, 5, self.proposed_date)
                         match_sheet.update_cell(idx, 6, "Scheduled")
+                        updated = True
                         break
-                else:
-                    print(f"[⚠️] Match ID {self.match_id} not found in Matches sheet")
+
+                if not updated:
+                    print(f"[⚠️] Match ID {self.match_id} not found in Matches sheet with both team names matched")
 
                 msg = (
                     f"✅ **Match Accepted:** `{self.team_a} vs {self.team_b}`\n"
@@ -175,6 +467,9 @@ class AcceptDenyMatchView(discord.ui.View):
                 match_channel = self.parent.bot.get_channel(self.parent.config.get("scheduled_channel_id"))
                 if match_channel:
                     if self.match_type == "challenge":
+                        if not self.week_number:
+                            match = re.search(r"Challenge(\d+)", self.match_id)
+                            self.week_number = match.group(1) if match else "?"
                         match_type_str = f"Challenge Match (Challenge {self.week_number})"
                     else:
                         match_type_str = f"Assigned Match (Week {self.week_number})"
@@ -629,6 +924,8 @@ class LeaguePanel(View):
     def team_exists(self, team_name):
         return any(team[0].lower() == team_name.lower() for team in self.teams_sheet.get_all_values())
 
+    __all__ = ["SignupView", "AcceptDenyJoinRequestView"]
+
 # -------------------- PLAYER SIGNUP --------------------
 
     @discord.ui.button(label="✅ Player Signup", style=discord.ButtonStyle.blurple, custom_id="league:player_signup", row=0)
@@ -645,87 +942,14 @@ class LeaguePanel(View):
             return
 
         # ❌ Check if already signed up
-        for row in players_sheet.get_all_values()[1:]:
-            if row[0] == user_id:
-                await interaction.response.send_message(
-                    f"❗ You are already signed up as a **{row[2]}**. Unsign and resign to switch role.",
-                    ephemeral=True
-                )
-                return
+        existing_rows = [row for row in players_sheet.get_all_values()[1:] if row[0].strip() == user_id]
 
-        class SignupView(discord.ui.View):
-            def __init__(self, bot, parent):
-                super().__init__(timeout=300)
-                self.bot = bot
-                self.parent = parent
-                self.role = None
-                self.timezone = None
-                self.add_item(self.RoleSelect(self))
-                self.add_item(self.TimezoneSelect(self))
-
-            class RoleSelect(discord.ui.Select):
-                def __init__(self, view):
-                    self.parent_view = view
-                    options = [
-                        discord.SelectOption(label="Player", value="Player"),
-                        discord.SelectOption(label="League Sub", value="League Sub")
-                    ]
-                    super().__init__(placeholder="Choose your role...", options=options, row=0)
-
-                async def callback(self, interaction: discord.Interaction):
-                    self.view.role = self.values[0]
-                    await interaction.response.defer()
-
-            class TimezoneSelect(discord.ui.Select):
-                def __init__(self, view):
-                    self.parent_view = view
-                    options = [
-                        discord.SelectOption(label="Pacific", value="US/Pacific"),
-                        discord.SelectOption(label="Mountain", value="US/Mountain"),
-                        discord.SelectOption(label="Central", value="US/Central"),
-                        discord.SelectOption(label="Eastern", value="US/Eastern"),
-                        discord.SelectOption(label="Atlantic", value="Canada/Atlantic"),
-                        discord.SelectOption(label="UK / London", value="Europe/London"),
-                        discord.SelectOption(label="Central Europe", value="Europe/Paris"),
-                        discord.SelectOption(label="Eastern Europe", value="Europe/Athens")
-                    ]
-                    super().__init__(placeholder="Choose your timezone...", options=options, row=1)
-
-                async def callback(self, interaction: discord.Interaction):
-                    self.view.timezone = self.values[0]
-                    await interaction.response.defer()
-
-            @discord.ui.button(label="✅ Submit", style=discord.ButtonStyle.green, row=2)
-            async def submit(self, interaction: discord.Interaction, button: discord.ui.Button):
-                role = self.role
-                tz = self.timezone
-
-                if not role or not tz:
-                    await interaction.response.send_message("❗ Please select both a role and a timezone.", ephemeral=True)
-                    return
-
-                try:
-                    players_sheet.append_row([user_id, username, role, tz])
-                    leaderboard = self.bot.player_leaderboard_sheet
-                    if not any(row[1] == user_id for row in leaderboard.get_all_values()[1:]):
-                        default_elo = self.bot.config.get("default_player_rating", 1025)
-                        leaderboard.append_row([username, user_id, str(default_elo), "0", "0", "0"])
-                except Exception as e:
-                    print(f"[❌] Failed to store signup: {e}")
-                    await interaction.response.send_message("❗ Signup failed. Try again later.", ephemeral=True)
-                    return
-
-                try:
-                    guild = interaction.guild
-                    if guild:
-                        role_obj = guild.get_role(self.bot.config.get("player_role_id") if role == "Player" else self.bot.config.get("league_sub_role_id"))
-                        if role_obj:
-                            await interaction.user.add_roles(role_obj)
-                except discord.Forbidden:
-                    print(f"⚠️ Could not assign role to {interaction.user}")
-
-                await self.parent.send_notification(f"📌 {interaction.user.mention} signed up as **{role}**")
-                await interaction.response.edit_message(content=f"✅ Signed up as **{role}** in `{tz}` time!", view=None)
+        if existing_rows:
+            await interaction.response.send_message(
+                f"❗ You are already signed up as a **{existing_rows[0][2]}**. Unsign and resign to switch role.",
+                ephemeral=True
+            )
+            return
 
         await interaction.response.send_message(
             "Please choose your signup role and timezone:",
@@ -741,7 +965,10 @@ class LeaguePanel(View):
 
         # ✅ Check if user is signed up
         if not self.player_signed_up(user_id):
-            await interaction.response.send_message("❗ You must sign up for the league before creating a team.", ephemeral=True)
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❗ You must sign up for the league before creating a team.", ephemeral=True)
+            else:
+                await interaction.followup.send("❗ You must sign up for the league before creating a team.", ephemeral=True)
             return
 
         # ❌ Check if user has league sub role
@@ -796,11 +1023,15 @@ class LeaguePanel(View):
 
                 min_players = self.parent.config.get("team_min_players", 3)
                 current_players = 1
-                self.parent.teams_sheet.append_row([team_name, f"{modal_interaction.user.display_name} ({modal_interaction.user.id})"] + [""] * 5)
+                self.parent.teams_sheet.append_row([
+                    team_name,
+                    f"{modal_interaction.user.display_name} ({modal_interaction.user.id})",
+                    "", "", "", "", "",
+                    "Active"  # ✅ default status
+                ])
                 message = (
                     f"✅ Team **{team_name}** created! Invite players to join your team.\n"
-                    f"👥 Current Players: **{current_players} / {min_players}**\n"
-                    f"🔔 You must have at least **{min_players} total players** (including yourself) to be eligible for matches."
+                    f"🔔 You must have at least **{min_players} total players** to be eligible for matches."
                 )
 
                 if modal_interaction.response.is_done():
@@ -814,7 +1045,7 @@ class LeaguePanel(View):
 
     # -------------------- PROPOSE MATCH --------------------
 
-    @discord.ui.button(label="📅 Propose Match", style=discord.ButtonStyle.green, custom_id="league:propose_match", row=2)
+    @discord.ui.button(label="📅 Propose Match", style=discord.ButtonStyle.green, custom_id="league:propose_match", row=3)
     async def propose_match(self, interaction: discord.Interaction, button: discord.ui.Button):
         user_id = str(interaction.user.id)
         user_team = None
@@ -1127,26 +1358,36 @@ class LeaguePanel(View):
                     try:
                         league_week_sheet = get_or_create_sheet(self.parent_view.parent.spreadsheet, "LeagueWeek", ["League Week"])
                         week_number = int(league_week_sheet.get_all_values()[1][0])
+                        weekly_sheet = get_or_create_sheet(self.parent_view.parent.spreadsheet, "Weekly Matches", [])
                         matches_sheet = get_or_create_sheet(self.parent_view.parent.spreadsheet, "Matches", [])
 
-                        match_id = None
-                        for row in matches_sheet.get_all_values()[1:]:
-                            if (row[1] == self.parent_view.team_a and row[2] == self.parent_view.team_b) or \
-                            (row[1] == self.parent_view.team_b and row[2] == self.parent_view.team_a):
-                                match_id = row[0]
-                                break
+                        if not self.parent_view.is_challenge:
+                            # ✅ ASSIGNED MATCH: Look up the correct match ID from Weekly Matches sheet
+                            found_row = next(
+                                (row for row in weekly_sheet.get_all_values()[1:]
+                                if {row[1].strip().lower(), row[2].strip().lower()} ==
+                                    {self.parent_view.team_a.strip().lower(), self.parent_view.team_b.strip().lower()}
+                                and str(row[0]) == str(week_number)),
+                                None
+                            )
 
-                        if not match_id:
-                            prefix = f"Challenge{week_number}" if self.parent_view.is_challenge else f"Week{week_number}"
+                            if found_row:
+                                match_id = found_row[3]
+                            else:
+                                raise Exception("Assigned match not found in Weekly Matches")
+
+                        else:
+                            # ✅ CHALLENGE MATCH: Generate new ChallengeX-M### ID
+                            prefix = f"Challenge{week_number}"
                             matches_this_week = [
                                 row for row in matches_sheet.get_all_values()[1:]
-                                if row and row[0].startswith(f"{prefix}-")
+                                if row and row[0].startswith(f"{prefix}-M")
                             ]
                             match_number = len(matches_this_week) + 1
-                            match_id = f"{prefix}-M{match_number:02d}"
+                            match_id = f"{prefix}-M{match_number:03d}"  # e.g. Challenge3-M001
 
                     except Exception as e:
-                        print(f"[❗] Match ID fallback: {e}")
+                        print(f"[❗] Failed match ID lookup/generation: {e}")
                         match_id = f"Match-{self.parent_view.team_a[:3]}-{self.parent_view.team_b[:3]}"
 
                     # Find captain
@@ -1190,7 +1431,7 @@ class LeaguePanel(View):
                             proposed_date,
                             match_id=match_id,
                             match_type="challenge" if self.parent_view.is_challenge else "assigned",
-                            week_number=week_number if not self.parent_view.is_challenge else None,
+                            week_number=week_number,
                             proposed_datetime=proposed_datetime,
                             proposer_id=interaction.user.id
                         )
@@ -1229,17 +1470,18 @@ class LeaguePanel(View):
                             f"**{self.parent_view.team_a}** vs **{self.parent_view.team_b}**\n"
                             f"🕓 Scheduled for {proposed_date}"
                         )
-                        try:
-                            if not interaction.response.is_done():
-                                await interaction.response.send_message(confirm, ephemeral=True)
-                            else:
-                                await interaction.followup.send(confirm, ephemeral=True)
-                        except discord.NotFound:
-                            print("❗ Interaction expired — could not send final confirmation.")
 
                     except Exception as e:
                         print(f"[❌] Failed to finalize proposal: {e}")
                         await interaction.followup.send("❗ Failed to deliver proposal.", ephemeral=True)
+                        return
+
+                    # 🧹 Clean up builder message with final confirmation
+                    try:
+                        if self.parent_view.message:
+                            await self.parent_view.message.edit(content=confirm, view=None)
+                    except Exception as e:
+                        print(f"[❌] Failed to clean up match builder: {e}")
 
         class ChallengeSearchModal(discord.ui.Modal, title="Search Challenge Opponent"):
             query = discord.ui.TextInput(label="Enter Team Name", required=True)
@@ -1349,7 +1591,7 @@ class LeaguePanel(View):
 
     # -------------------- PROPOSE SCORE--------------------
 
-    @discord.ui.button(label="🏆 Propose Score", style=discord.ButtonStyle.success, custom_id="league:propose_score", row=2)
+    @discord.ui.button(label="🏆 Propose Score", style=discord.ButtonStyle.success, custom_id="league:propose_score", row=3)
     async def propose_score(self, interaction: discord.Interaction, button: discord.ui.Button):
         user_id = str(interaction.user.id)
         user_team = None
@@ -1541,10 +1783,16 @@ class LeaguePanel(View):
                     if not gamemode:
                         raise ValueError(f"Gamemode not set for Map {map_num}")
 
-                    limit = 2 if gamemode == "Capture Point" else 2
+                    limit = 2 if gamemode == "Capture Point" else 1
+
+                    # 🔤 Placeholder explanation
+                    if gamemode == "Payload":
+                        placeholder = f"{team_name} Score (1 = Win, 0 = Loss)"
+                    else:
+                        placeholder = f"{team_name} Rounds Won (Best-of-3)"
 
                     super().__init__(
-                        placeholder=f"{team_name} Rounds Won (Best-of-3)",
+                        placeholder=placeholder,
                         options=[discord.SelectOption(label=str(i), value=str(i)) for i in range(0, limit + 1)],
                         custom_id=f"score_{map_num}_{team}",
                         row=row
@@ -1937,7 +2185,7 @@ class LeaguePanel(View):
 
     # ------------------ Find Sub ----------------------
     
-    @discord.ui.button(label="🔍 Find Eligible Subs", style=discord.ButtonStyle.green, custom_id="league:find_subs", row=2)
+    @discord.ui.button(label="🔍 Find Eligible Subs", style=discord.ButtonStyle.green, custom_id="league:find_subs", row=3)
     async def find_subs(self, interaction: discord.Interaction, button: discord.ui.Button):
         user_id = str(interaction.user.id)
         co_captain_role_id = self.bot.config.get("co_captain_role_id")
@@ -2064,7 +2312,10 @@ class LeaguePanel(View):
         
         # Roster Lock Check
         if is_roster_locked(self.bot.config):
-            await self.safe_send(interaction, "🔒 Rosters are locked, Cannot Join at this time.")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("🔒 Rosters are locked, Cannot Join at this time.", ephemeral=True)
+            else:
+                await interaction.followup.send("🔒 Rosters are locked, Cannot Join at this time.", ephemeral=True)
             return
 
         class TeamSearchModal(discord.ui.Modal, title="Search Team Name"):
@@ -2101,14 +2352,24 @@ class LeaguePanel(View):
             async def select_team(self, interaction: discord.Interaction):
                 selected_team = self.children[0].values[0]
 
-                headers = self.parent_view.teams_sheet.row_values(1)
-
                 for row in self.parent_view.teams_sheet.get_all_values()[1:]:
                     members = row[1:7]
                     for cell in members:
                         if extract_user_id(cell) == str(self.user.id):
                             await interaction.response.send_message("❗ You are already on a team.", ephemeral=True)
                             return
+                # ✅ Get current player count for the selected team
+                for row in self.parent_view.teams_sheet.get_all_values()[1:]:
+                    if row[0].lower() == selected_team.lower():
+                        player_cells = row[2:7]
+                        current_players = [p for p in player_cells if p.strip()]
+                        if len(current_players) >= self.bot.config.get("team_max_players", 6):
+                            await interaction.response.send_message(
+                                f"❗ **{selected_team}** already has the maximum number of players.",
+                                ephemeral=True
+                            )
+                            return
+                        break
 
                 guild = interaction.guild
                 team_role = discord.utils.get(guild.roles, name=f"Team {selected_team}")
@@ -2138,14 +2399,27 @@ class LeaguePanel(View):
 
                     view = AcceptDenyJoinRequestView(self.parent_view, selected_team, self.user, guild.id, captain)
                     
-                    await captain.send(
-                        f"📥 **{self.user.display_name}** wants to join **{selected_team}**. Approve?\n"
-                        f"⏳ *This request will expire {expires_in_str}.*",
+                    msg = await captain.send(
+                        f"📥 **{self.user.display_name}** wants to join **{selected_team}**. Approve?\n",
                         view=view
                     )
 
-                    self.bot.loop.create_task(view.expire_notice_dm())
-                    await interaction.response.send_message("✅ Request sent to team captain via DM.", ephemeral=True)
+                    # 🔒 Save to file for rehydration
+                    save_join_request_to_file({
+                        "type": "dm",
+                        "message_id": msg.id,
+                        "channel_id": msg.channel.id,
+                        "guild_id": guild.id,
+                        "team": selected_team,
+                        "user_id": self.user.id,
+                        "username": self.user.display_name
+                    })
+
+#                    self.bot.loop.create_task(view.expire_notice_dm())
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message("✅ Request sent to team captain via DM.", ephemeral=True)
+                    else:
+                        await interaction.followup.send("✅ Request sent to team captain via DM.", ephemeral=True)
 
                 except discord.Forbidden:
                     fallback_category_id = self.parent_view.config.get("fallback_category_id")
@@ -2175,132 +2449,23 @@ class LeaguePanel(View):
                         await fallback_channel.set_permissions(captain, read_messages=True, send_messages=True)
 
                     # After fallback_channel.send(...)
-                    await fallback_channel.send(
-                        f"📥 {captain.mention} **{self.user.display_name}** wants to join **{selected_team}**. Approve?\n"
-                        f"⏳ *This request will expire {expires_in_str}.*",
+                    msg = await fallback_channel.send(
+                        f"📥 {captain.mention} **{self.user.display_name}** wants to join **{selected_team}**. Approve?\n",
                         view = AcceptDenyJoinRequestView(self.parent_view, selected_team, self.user, guild.id, captain)
                     )
 
+                    save_join_request_to_file({
+                        "type": "channel",
+                        "message_id": msg.id,
+                        "channel_id": fallback_channel.id,
+                        "guild_id": guild.id,
+                        "team": selected_team,
+                        "user_id": self.user.id,
+                        "username": self.user.display_name
+                    })
+
                     # Use safe send response to user
                     await safe_send(interaction, "✅ Captain's DMs closed, sent request to private channel.")
-
-                    # Define auto_delete
-                    async def auto_delete(channel, view):
-                        await asyncio.sleep(180)
-                        if view.request_handled:
-                            return
-                        try:
-                            await channel.delete()
-                        except discord.NotFound:
-                            print("❗ Tried to auto-delete, but channel no longer exists.")
-                        except Exception as e:
-                            print(f"❗ Error deleting channel: {e}")
-
-                    # Schedule it
-                    self.parent_view.bot.loop.create_task(auto_delete(fallback_channel, view))
-
-        class AcceptDenyJoinRequestView(discord.ui.View):
-            def __init__(self, parent_view, team_name, invitee, guild_id, captain):
-                super().__init__(timeout=None)
-                self.parent_view = parent_view
-                self.team_name = team_name
-                self.invitee = invitee
-                self.guild_id = guild_id
-                self.captain = captain
-                self.request_handled = False
-
-            async def expire_notice_dm(self):
-                await asyncio.sleep(179)  # 1 second before timeout
-                if self.request_handled:
-                    return
-                try:
-                    await self.captain.send(
-                        f"❌ The join request from **{self.invitee.display_name}** has expired.\n"
-                        "Please ask them to send another request if you'd still like to add them."
-                    )
-                except discord.Forbidden:
-                    print(f"📪 Could not DM captain {self.captain.display_name} with expiration notice.")
-
-            @discord.ui.button(label="✅ Accept", style=discord.ButtonStyle.success, custom_id="team_join_accept")
-            async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-                self.request_handled = True
-                guild = self.parent_view.bot.get_guild(self.guild_id)
-                team_role = discord.utils.get(guild.roles, name=f"Team {self.team_name}")
-
-                if not team_role:
-                    await interaction.response.send_message("❗ Team role no longer exists.", ephemeral=True)
-                    return
-
-                already_on_team = False
-                for row in self.parent_view.teams_sheet.get_all_values():
-                    for cell in row[1:7]:
-                        if cell.strip() == f"{self.invitee.display_name} ({self.invitee.id})":
-                            already_on_team = True
-                            break
-                    if already_on_team:
-                        break
-
-                if already_on_team:
-                    await interaction.response.send_message("❗ Player is already on another team.", ephemeral=True)
-                    return
-
-                await self.invitee.add_roles(team_role)
-
-                for idx, row in enumerate(self.parent_view.teams_sheet.get_all_values(), 1):
-                    if row[0].lower() == self.team_name.lower():
-                        max_players = self.parent_view.config.get("team_max_players", 6)
-                        current_players = [p for p in row[1:7] if p.strip()]
-                        if len(current_players) >= max_players:
-                            await interaction.response.send_message(
-                                f"❗ This team already has the maximum number of players ({max_players}).",
-                                ephemeral=True
-                            )
-                            return
-                        for i in range(1, 7):
-                            if row[i] == "":
-                                self.parent_view.teams_sheet.update_cell(idx, i + 1, f"{self.invitee.display_name} ({self.invitee.id})")
-                                break
-
-                        player_count = sum(1 for cell in row[1:7] if cell.strip())
-                        min_required = self.parent_view.config.get("team_min_players", 3)
-
-                        if player_count == min_required:
-                            try:
-                                # 🔍 Extract captain user ID from the row
-                                captain_cell = row[1]
-                                captain_id = extract_user_id(captain_cell)
-
-                                captain_mention = f"<@{captain_id}>" if captain_id else "Captain"
-
-                                await self.parent_view.send_notification(
-                                    f"✅ {captain_mention} — your team **{self.team_name}** has reached the minimum required players ({min_required}) and is now eligible for matches!"
-                                )
-                            except Exception as e:
-                                print(f"❗ Failed to send team eligibility notification: {e}")
-                        break
-
-                await interaction.response.send_message("✅ Player added to team.", ephemeral=True)
-
-                try:
-                    await self.parent_view.send_notification(
-                        f"👥 {self.invitee.mention} has joined **{self.team_name}**!"
-                    )
-                except Exception as e:
-                    print(f"❗ Failed to send join team notification: {e}")
-
-                await interaction.message.delete()
-
-                if isinstance(interaction.channel, discord.TextChannel) and interaction.channel.name == "team-requests":
-                    await interaction.channel.delete()
-
-            @discord.ui.button(label="❌ Deny", style=discord.ButtonStyle.danger, custom_id="team_join_deny")
-            async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
-                self.request_handled = True
-                await interaction.response.send_message("❌ Request denied.", ephemeral=True)
-                await interaction.message.delete()
-
-                if isinstance(interaction.channel, discord.TextChannel) and interaction.channel.name == "team-requests":
-                    await interaction.channel.delete()
 
         await interaction.response.send_modal(TeamSearchModal(self))
 
@@ -2423,12 +2588,13 @@ class LeaguePanel(View):
                     return
 
                 class RoleTypeSelect(discord.ui.View):
-                    def __init__(self, parent, team_name, old_captain, team_idx):
+                    def __init__(self, parent, team_name, old_captain, team_idx, invoker_id):
                         super().__init__(timeout=None)
                         self.parent = parent
                         self.team_name = team_name
                         self.old_captain = old_captain
                         self.team_idx = team_idx
+                        self.invoker_id = invoker_id
 
                         select = discord.ui.Select(
                             placeholder="Promote to Captain or Co-Captain?",
@@ -2442,71 +2608,111 @@ class LeaguePanel(View):
 
                     async def select_role_type(self, i):
                         role_type = i.data['values'][0]
-                        await i.response.edit_message(content=f"Select player to promote to **{role_type.replace('_', ' ').title()}**:", view=PromoteSelect(self.parent, self.team_name, self.old_captain, self.team_idx, role_type))
+                        await i.response.edit_message(content=f"Select player to promote to **{role_type.replace('_', ' ').title()}**:", view=PromoteSelect(self.parent, self.team_name, self.old_captain, self.team_idx, role_type, self.invoker_id))
 
                 class PromoteSelect(discord.ui.View):
-                    def __init__(self, parent, team_name, old_captain, team_idx, role_type):
+                    def __init__(self, parent, team_name, old_captain, team_idx, role_type, invoker_id):
                         super().__init__(timeout=None)
                         self.parent = parent
                         self.team_name = team_name
                         self.old_captain = old_captain
                         self.team_idx = team_idx
-                        self.role_type = role_type
+                        self.role_type = role_type  # "captain" or "co_captain"
+                        self.invoker_id = str(invoker_id)
 
-                        select = discord.ui.Select(placeholder="Select player to promote", options=options)
+                        # Fetch team row
+                        row = parent.teams_sheet.row_values(team_idx)
+                        row += [""] * (7 - len(row))  # Ensure row has at least 7 cells
+
+                        # Get current guild
+                        guild = parent.bot.get_guild(parent.bot.config["guild_id"])
+                        options = []
+
+                        # Skip promoting existing captain/co-captain depending on role_type
+                        exclude_user_id = self.invoker_id
+
+                        for i in range(1, 7):  # Team slots: captain + P2–P6
+                            user_id = extract_user_id(row[i])
+                            if not user_id or user_id == exclude_user_id:
+                                continue
+
+                            member = guild.get_member(int(user_id))
+                            if not member:
+                                continue
+
+                            label = member.display_name
+                            value = f"{label} ({user_id})"
+                            options.append(discord.SelectOption(label=label, value=value))
+
+                        # Fallback in case no valid options
+                        if not options:
+                            options.append(discord.SelectOption(label="❌ No eligible players", value="disabled", default=True))
+
+                        select = discord.ui.Select(placeholder="Select player to promote", options=options, disabled=(options[0].value == "disabled"))
                         select.callback = self.promote
                         self.add_item(select)
 
-                    async def promote(self, select_interaction):
+                    async def promote(self, select_interaction: discord.Interaction):
                         new_user_id = extract_user_id(select_interaction.data['values'][0])
                         guild = select_interaction.guild
 
-                        row = self.parent.teams_sheet.row_values(self.team_idx)
-
-                        # 🧠 Get the member BEFORE any early returns
-                        new_member = guild.get_member(int(new_user_id))
-
-                        # ✅ Prevent promoting same player again
-                        if self.role_type == "captain" and extract_user_id(row[1]) == new_user_id:
-                            # Optional cleanup of co-cap role if needed
-                            co_captain_role_id = self.bot.config.get("co_captain_role_id")
-                            if co_captain_role_id:
-                                co_captain_role = guild.get_role(co_captain_role_id)
-                                if co_captain_role and new_member and co_captain_role in new_member.roles:
-                                    try:
-                                        await new_member.remove_roles(co_captain_role)
-                                    except discord.Forbidden:
-                                        print(f"⚠️ Could not remove Co-Captain role from {new_member.display_name}")
-                            await select_interaction.response.send_message("❗ That player is already captain.", ephemeral=True)
+                        if not new_user_id or not new_user_id.isdigit():
+                            await select_interaction.response.send_message("❌ Failed to promote: missing or invalid user ID.", ephemeral=True)
                             return
 
-                        if self.role_type == "co_captain" and len(row) > 2 and extract_user_id(row[2]) == new_user_id:
-                            co_captain_role_id = self.parent.bot.config.get("co_captain_role_id")
-                            co_captain_role = guild.get_role(co_captain_role_id)
-                            
+                        new_member = guild.get_member(int(new_user_id))
+                        if not new_member:
+                            await select_interaction.response.send_message("❌ User not found in the server.", ephemeral=True)
+                            return
+
+                        row = self.parent.teams_sheet.row_values(self.team_idx)
+                        row += [""] * (7 - len(row))  # pad to ensure at least 7 cells
+
+                        # Prevent duplicate promotion
+                        if self.role_type == "captain" and extract_user_id(row[1]) == new_user_id:
+                            await select_interaction.response.send_message("❗ That player is already the captain.", ephemeral=True)
+                            return
+
+                        if self.role_type == "co_captain":
+                            co_captain_role = select_interaction.guild.get_role(self.parent.bot.config.get("co_captain_role_id"))
+                            new_member = select_interaction.guild.get_member(int(new_user_id))
+
                             if co_captain_role and new_member and co_captain_role in new_member.roles:
-                                await select_interaction.response.send_message("❗ That player is already co-captain.", ephemeral=True)
+                                await select_interaction.response.send_message("❗ That player is already a co-captain.", ephemeral=True)
                                 return
 
-                        old_captain_member = guild.get_member(int(extract_user_id(self.old_captain)))
-                        new_member = guild.get_member(int(new_user_id))
+                        old_captain_member = guild.get_member(int(extract_user_id(self.old_captain))) if extract_user_id(self.old_captain) else None
 
                         captain_role = guild.get_role(self.parent.bot.config.get("universal_captain_role_id"))
+                        co_captain_role = guild.get_role(self.parent.bot.config.get("co_captain_role_id"))
+
                         if self.role_type == "captain":
-                            # 🏅 Promote to Captain
+                            # 🔁 Captain promotion
                             if captain_role:
                                 if old_captain_member and captain_role in old_captain_member.roles:
                                     await old_captain_member.remove_roles(captain_role)
-                                if new_member:
-                                    await new_member.add_roles(captain_role)
+                                await new_member.add_roles(captain_role)
 
-                            row = self.parent.teams_sheet.row_values(self.team_idx)
+                            # 🔍 Remove co-captain role from previous co-captain
+                            co_captain_role = guild.get_role(self.parent.bot.config.get("co_captain_role_id"))
+                            old_cocap_id = extract_user_id(row[2]) if len(row) > 2 and row[2].strip() else None
+
+                            if co_captain_role and old_cocap_id:
+                                try:
+                                    old_cocap_member = guild.get_member(int(old_cocap_id))
+                                    if old_cocap_member and co_captain_role in old_cocap_member.roles:
+                                        await old_cocap_member.remove_roles(co_captain_role)
+                                except Exception as e:
+                                    print(f"⚠️ Failed to remove Co-Captain role from old co-captain: {e}")
+
+                            # Swap old captain into empty player slot
                             for i in range(1, 7):
                                 if extract_user_id(row[i]) == new_user_id:
                                     row[i] = self.old_captain
                                     break
+
                             row[1] = f"{new_member.display_name} ({new_member.id})"
-                            self.parent.teams_sheet.update(f"A{self.team_idx}:G{self.team_idx}", [row])
+                            self.parent.teams_sheet.update(f"A{self.team_idx}:G{self.team_idx}", [row[:7]])
 
                             await select_interaction.response.send_message(
                                 f"👑 {new_member.mention} is now the captain of **{self.team_name}**!",
@@ -2515,35 +2721,36 @@ class LeaguePanel(View):
                             await self.parent.send_notification(f"👑 {new_member.mention} promoted to **Captain of {self.team_name}**.")
 
                         else:
-                            # 🤝 Promote to Co-Captain
-                            row = self.parent.teams_sheet.row_values(self.team_idx)
-                            old_cocap_id = extract_user_id(row[2]) if len(row) > 2 else None
+                            # 🤝 Co-captain promotion
+                            old_cocap_id = extract_user_id(row[2]) if row[2].strip() else None
 
                             # Update sheet
                             row[2] = f"{new_member.display_name} ({new_member.id})"
-                            self.parent.teams_sheet.update(f"A{self.team_idx}:G{self.team_idx}", [row])
+                            self.parent.teams_sheet.update(f"A{self.team_idx}:G{self.team_idx}", [row[:7]])
 
-                            # Discord role adjustments
-                            co_captain_role_id = self.parent.bot.config.get("co_captain_role_id")
-                            if co_captain_role_id:
-                                co_captain_role = guild.get_role(co_captain_role_id)
+                            # Remove old co-captain role
+                            if co_captain_role and old_cocap_id:
+                                try:
+                                    old_cocap_member = guild.get_member(int(old_cocap_id))
+                                    if old_cocap_member and co_captain_role in old_cocap_member.roles:
+                                        await old_cocap_member.remove_roles(co_captain_role)
+                                except Exception as e:
+                                    print(f"⚠️ Failed to remove Co-Captain role: {e}")
 
-                                # Remove role from old Co-Captain
-                                if old_cocap_id:
-                                    old_member = guild.get_member(int(old_cocap_id))
-                                    if old_member and co_captain_role in old_member.roles:
-                                        try:
-                                            await old_member.remove_roles(co_captain_role)
-                                        except discord.Forbidden:
-                                            print(f"⚠️ Failed to remove Co-Captain role from {old_member.display_name}")
+                            # Safety: remove captain role if misassigned
+                            if captain_role and captain_role in new_member.roles:
+                                try:
+                                    await new_member.remove_roles(captain_role)
+                                    print(f"⚠️ Removed unintended captain role from {new_member.display_name}")
+                                except Exception as e:
+                                    print(f"⚠️ Error removing captain role: {e}")
 
-                                # Give role to new Co-Captain
-                                if new_member and co_captain_role:
-                                    try:
-                                        await new_member.add_roles(co_captain_role)
-                                    except discord.Forbidden:
-                                        print(f"⚠️ Failed to assign Co-Captain role to {new_member.display_name}")
-
+                            # Add co-captain role
+                            if co_captain_role:
+                                try:
+                                    await new_member.add_roles(co_captain_role)
+                                except Exception as e:
+                                    print(f"⚠️ Failed to add Co-Captain role: {e}")
 
                             await select_interaction.response.send_message(
                                 f"⭐ {new_member.mention} is now the co-captain of **{self.team_name}**!",
@@ -2553,13 +2760,12 @@ class LeaguePanel(View):
 
                 await interaction.response.send_message(
                     "Do you want to promote to **Captain** or **Co-Captain**?",
-                    view=RoleTypeSelect(self, team_name, username_id, idx),
+                    view=RoleTypeSelect(self, team_name, username_id, idx, interaction.user.id),
                     ephemeral=True
                 )
                 return
 
         await interaction.response.send_message("❗ You are not a captain or on a team.", ephemeral=True)
-
 
     # -------------------- DISBAND TEAM --------------------
 
@@ -2665,7 +2871,10 @@ class LeaguePanel(View):
 
                         # Send confirmation
                         await modal_interaction.response.send_message("✅ Team disbanded successfully.", ephemeral=True)
-                        await self.parent_view.send_notification(f"💥 **{self.team_name}** has been disbanded.\n{mention_text}")
+                        try:
+                            await self.parent_view.send_notification(f"💥 **{self.team_name}** has been disbanded.\n{mention_text}")
+                        except Exception as e:
+                            print(f"❗ Failed to send disband notification: {e}")
 
                 await interaction.response.send_modal(
                     DisbandModal(self, self.bot, team_name, self.teams_sheet.get_all_values().index(team_row)+1)
@@ -2781,7 +2990,7 @@ class LeaguePanel(View):
 
     # --------------- Coin Flip ---------------------
 
-    @discord.ui.button(label="🎲 Coin Flip", style=discord.ButtonStyle.green, custom_id="league:coin_flip", row=2)
+    @discord.ui.button(label="🎲 Coin Flip", style=discord.ButtonStyle.green, custom_id="league:coin_flip", row=3)
     async def coin_flip(self, interaction: discord.Interaction, button: discord.ui.Button):
         user = interaction.user
         guild = interaction.guild
@@ -3312,7 +3521,81 @@ class LeaguePanel(View):
                         print(f"⚠️ Failed to rename team in {sheet_name}: {e}")
 
         await interaction.response.send_modal(RenameTeamModal(self, old_team_name, row_idx))
+    
+    #@discord.ui.button(label="📡 Set Team Status", style=discord.ButtonStyle.gray, custom_id="league:set_team_status", row=2)
+    async def set_team_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user_id = str(interaction.user.id)
+        co_captain_role_id = self.bot.config.get("co_captain_role_id")
+        team_row = None
 
+        # 🔍 Find team where user is captain or co-captain
+        for row in self.teams_sheet.get_all_values()[1:]:
+            if is_captain_or_cocap(user_id, interaction.user, row, co_captain_role_id):
+                team_row = row
+                break
+
+        if not team_row:
+            await interaction.response.send_message("❗ Only captains or co-captains can change team status.", ephemeral=True)
+            return
+
+        team_name = team_row[0]
+
+        class StatusSelect(discord.ui.View):
+            def __init__(self, parent, team_name):
+                super().__init__(timeout=60)
+                self.parent = parent
+                self.team_name = team_name
+
+                select = discord.ui.Select(
+                    placeholder="Select your team's status",
+                    options=[
+                        discord.SelectOption(label="✅ Active", value="Active", description="Eligible for match scheduling"),
+                        discord.SelectOption(label="❌ Inactive", value="Inactive", description="Skip match scheduling")
+                    ]
+                )
+                select.callback = self.set_status
+                self.add_item(select)
+
+            async def set_status(self, i: discord.Interaction):
+                status_value = i.data['values'][0]
+
+                # Find row and update status column (assume it's column H = index 8)
+                for idx, row in enumerate(self.parent.teams_sheet.get_all_values()[1:], start=2):
+                    if row[0] == self.team_name:
+                        while len(row) < 8:
+                            row.append("")  # pad missing columns
+                        self.parent.teams_sheet.update_cell(idx, 8, status_value)
+                        break
+
+                await i.response.send_message(f"✅ Set **{self.team_name}** status to `{status_value}`.", ephemeral=True)
+
+                # ⬇️ Attempt to mention the captain
+                try:
+                    teams_sheet = get_or_create_sheet(self.parent.spreadsheet, "Teams", [])
+                    team_row = next((r for r in teams_sheet.get_all_values()[1:] if r[0] == self.team_name), None)
+
+                    captain_mention = self.team_name
+                    if team_row and len(team_row) > 1 and "(" in team_row[1] and ")" in team_row[1]:
+                        captain_id = team_row[1].split("(")[-1].split(")")[0]
+                        captain_mention = f"<@{captain_id}>"
+
+                    await self.parent.send_notification(
+                        f"📡 `{self.team_name}` status changed to **{status_value}**.\n👑 Notifying captain: {captain_mention}"
+                    )
+
+                except Exception as e:
+                    print(f"❗ Failed to notify team status change: {e}")
+                    await self.parent.send_notification(
+                        f"📡 `{self.team_name}` status changed to **{status_value}**. (Could not mention captain)"
+                    )
+
+        await interaction.response.send_message(
+            f"📡 Set match status for **{team_name}**:",
+            view=StatusSelect(self, team_name),
+            ephemeral=True
+        )
+
+        __all__ = ["SignupView", "AcceptDenyJoinRequestView"]
 
 
 
