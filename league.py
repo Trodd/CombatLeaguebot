@@ -9,8 +9,11 @@ import command_buttons  # <-- League Command Panel buttons
 import asyncio, json
 import re
 import concurrent.futures
+from command_buttons import SignupView
 from discord import Embed, NotFound, HTTPException
 from discord.ui import View, Button
+import os
+from command_buttons import AcceptDenyJoinRequestView
 
 # -------------------- Load config --------------------
 
@@ -56,7 +59,7 @@ def get_or_create_sheet(spreadsheet, name, headers):
     return spreadsheet.worksheet(name)
 
 players_sheet = get_or_create_sheet(spreadsheet, "Players", ["User ID", "Username", "Role", "Timezone"])
-teams_sheet = get_or_create_sheet(spreadsheet, "Teams", ["Team Name", "Player 1", "Player 2", "Player 3", "Player 4", "Player 5", "Player 6"])
+teams_sheet = get_or_create_sheet(spreadsheet, "Teams", ["Team Name", "Player 1", "Player 2", "Player 3", "Player 4", "Player 5", "Player 6", "Status"])
 matches_sheet = get_or_create_sheet(spreadsheet, "Matches", ["match_id", "Team A", "Team B", "Proposed Date", "Scheduled Date", "Status", "Winner", "Loser", "Proposed By"])
 scoring_sheet = get_or_create_sheet(spreadsheet, "Scoring", [
     "Match ID", "Team A", "Team B",
@@ -90,9 +93,15 @@ rename_log_sheet = get_or_create_sheet(spreadsheet, "Team Rename Log", ["Role ID
 # -------------------- Bot Setup --------------------
 
 intents = discord.Intents.default()
-intents.members = True  # ✅ FIXED: Required to use fetch_members and see all members
+intents.message_content = True
+intents.members = True  
+intents.guilds = True
+intents.presences = False
+intents.message_content = False
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+bot.players_sheet = players_sheet
+bot.teams_sheet = teams_sheet
 bot.proposed_scores_sheet = proposed_scores_sheet
 bot.config = config  # ✅ Very important → allows match.py and others to access config
 bot.spreadsheet = spreadsheet
@@ -107,6 +116,11 @@ async def on_ready():
     # ✅ Delete old Dev Panels first
     await dev.cleanup_dev_panels(bot)
 
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return  # Ignore other bots
+    return  # Don't process any commands
 
 # -------------------- Helper Functions --------------------
 
@@ -176,7 +190,6 @@ async def auto_update_team_embeds(bot, teams_sheet):
 
         # 🔁 Always rebuild cache if empty
         if not message_cache:
-            print("[📤] Rebuilding message cache from history...")
             async for msg in channel.history(limit=100):
                 if msg.author == bot.user and msg.embeds:
                     embed = msg.embeds[0]
@@ -382,9 +395,8 @@ async def auto_update_team_embeds(bot, teams_sheet):
 bot.was_disconnected = False  # Define this once near the top after bot = commands.Bot(...)
 
 def extract_id(text):
-    match = re.search(r"\((\d+)\)", text)
+    match = re.search(r"\((\d{17,20})\)", text)
     return match.group(1) if match else None
-
 
 async def cleanup_departed_members(bot, players_sheet, teams_sheet):
     print("[🧹] Running startup cleanup...")
@@ -425,6 +437,12 @@ async def cleanup_departed_members(bot, players_sheet, teams_sheet):
             replacement = extract_id(row[2]) if len(row) > 2 else None
             if replacement and replacement in member_ids:
                 teams_sheet.update_cell(i + 1, 2, row[2])  # Promote Player 2
+                captain_role_id = bot.config.get("universal_captain_role_id")
+                if replacement and captain_role_id:
+                    role = discord.utils.get(guild.roles, id=captain_role_id)
+                    member = guild.get_member(int(replacement))
+                    if role and member:
+                        await member.add_roles(role, reason="Promoted to Captain")
                 teams_sheet.update_cell(i + 1, 3, "")      # Clear old P2
                 promoted += 1
                 await send_notification(f"👑 Captain left — promoted Player 2 to captain of **{team_name}**.")
@@ -456,7 +474,7 @@ async def cleanup_departed_members(bot, players_sheet, teams_sheet):
 @bot.event
 async def on_member_remove(member):
     user_id = str(member.id)
-    username = member.display_name.lower()
+    username = member.name
 
     players = bot.players_sheet
     teams = bot.teams_sheet
@@ -478,7 +496,8 @@ async def on_member_remove(member):
 
         team_name = row[0]
         for j in range(1, 7):
-            if user_id in row[j] or username in row[j].lower():
+            cell_id = extract_id(row[j])
+            if cell_id == user_id:
                 teams.update_cell(i, j + 1, "")  # Clear the player cell
 
                 if j == 1:  # Captain left
@@ -529,11 +548,76 @@ async def watchdog_check():
     except Exception as e:
         print(f"[⚠️] Discord unreachable: {e}")
         bot.was_disconnected = True
+# Rehydrate join team request
+PENDING_JOIN_FOLDER = "json"
+PENDING_JOIN_FILE = os.path.join(PENDING_JOIN_FOLDER, "pending_join_requests.json")
+
+async def rehydrate_join_requests(bot):
+    if not os.path.exists(PENDING_JOIN_FILE):
+        return
+
+    try:
+        with open(PENDING_JOIN_FILE, "r") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"❌ Failed to read join request file: {e}")
+        return
+
+    valid_entries = []
+
+    for entry in data:
+        try:
+            guild = bot.get_guild(entry["guild_id"])
+            if not guild:
+                continue
+
+            try:
+                channel = await bot.fetch_channel(entry["channel_id"])
+            except discord.NotFound:
+                print(f"⚠️ Channel {entry['channel_id']} no longer exists. Skipping join request.")
+                continue
+
+            try:
+                message = await channel.fetch_message(entry["message_id"])
+            except discord.NotFound:
+                print(f"⚠️ Message {entry['message_id']} no longer exists. Skipping join request.")
+                continue
+
+            captain = guild.get_member(entry["user_id"])
+            invitee = guild.get_member(entry["user_id"])
+            if not captain or not invitee:
+                continue
+
+            view = AcceptDenyJoinRequestView(
+                parent_view=bot.league_panel,
+                team_name=entry["team"],
+                invitee=invitee,
+                guild_id=guild.id,
+                captain=captain
+            )
+            await message.edit(view=view)
+#            if not bot.is_closed():
+#                bot.loop.create_task(view.expire_notice_dm())
+
+            valid_entries.append(entry)
+
+        except Exception as e:
+            print(f"⚠️ Failed to rehydrate join request message: {e}")
+
+    # ✍️ Rewrite the file with only valid entries
+    with open(PENDING_JOIN_FILE, "w") as f:
+        json.dump(valid_entries, f, indent=2)
 
 @bot.event
 async def on_ready():
     await bot.tree.sync()
     await validate_roles(bot)
+    for guild in bot.guilds:
+        await guild.chunk()
+    try:
+        bot.add_view(SignupView(bot, parent=None))
+    except Exception as e:
+        print(f"❌ Failed to register SignupView: {e}")
 
 
     await cleanup_departed_members(bot, players_sheet, teams_sheet)
@@ -575,6 +659,7 @@ async def on_ready():
 
         bot.add_view(view)
         bot.league_panel = view  # make LeaguePanel accessible for views like AcceptDenyMatchView
+        await rehydrate_join_requests(bot)
         bot.scheduled_sheet = scheduled_sheet
         channel_id = config.get("panel_channel_id")
         if not channel_id:
@@ -624,7 +709,8 @@ async def on_ready():
                         "`✏️ Change Team Name` – Rename your existing team (captain only)\n"
                         "`⭐ Promote Player` – Assign a new captain/co-captain\n"
                         "`❗ Disband Team` – Permanently disband your team(team will not have history)\n"
-                        "`👢 Kick Player` - Kick a player from your team"
+                        "`👢 Kick Player` - Kick a player from your team\n"
+                        "`📡 Team Status` – Captains/co-captains can mark their team as **Active** or **Inactive**"
                     ),
                     inline=False
                 )
@@ -656,6 +742,7 @@ async def on_ready():
 
             except Exception as e:
                 print(f"❌ Failed to post LeaguePanel: {e}")
+    
 
         # ✅ Rehydrate match proposals
     proposed_rows = proposed_sheet.get_all_values()[1:]
@@ -773,5 +860,4 @@ async def on_ready():
     bot.loop.create_task(auto_update_team_embeds(bot, teams_sheet))
 
 bot.run(BOT_TOKEN)
-
 
