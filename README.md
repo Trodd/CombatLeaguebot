@@ -7,21 +7,27 @@ A full-featured Discord bot for running competitive leagues with Google Sheets a
 ## 📌 Features
 
 ### 🎮 Player Features
-- Sign up and unsign
-- Join and leave teams
-- Propose matches and submit scores
+- Sign up with time zone and role (Player or League Sub)
+- Request to join or leave teams
+- Propose matches and submit scores (map-by-map with gamemode)
+- Auto-pings teammates when match proposals or results are submitted
 
 ### 🛡️ Team & Match Management
-- Team creation, disbanding, captain promotion
-- Match proposal with DM/fallback flow
-- Score submission with approval system
-- Weekly automated match generation
-- ELO-based leaderboard
+- Create, rename, disband teams
+- Promote captain or co-captain with Discord role sync
+- Weekly auto-generated matches with fallback DMs
+- Challenge match support with acceptance flow
+- Score submission with interactive confirmation and map breakdown
+- ELO-based **Team Leaderboard** and **Player Leaderboard**
+- Forfeit handling, double forfeits, and historical archiving
 
 ### 🧰 Admin Tools
-- Match, score, and roster overrides
-- Kick/ban users
-- Dev-only control panels for fast maintenance
+- Force schedule matches, scores, or weekly matchups
+- Undo scores or clear proposed matches via panel
+- Adjust team ELO or force disband teams
+- Kick/ban players and auto-remove departed members
+- Persistent views & panel rehydration after bot restart
+- Real-time team embed updates showing captains, co-captains, and members
 
 ---
 
